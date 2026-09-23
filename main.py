@@ -91,9 +91,9 @@ async def background_db_updater():
             print(f"[CRON] Prossimo aggiornamento alle 23:00 (tra {int(seconds_to_wait / 3600)} ore).")
             
             await asyncio.sleep(seconds_to_wait)
-            print("[CRON] Avvio aggiornamento giornaliero del database...")
+            print("[CRON] Avvio aggiornamento giornaliero del database (Sospeso per ToS Moxfield)...")
             
-            await run_in_threadpool(master_scraper.run_scraper)
+            # await run_in_threadpool(master_scraper.run_scraper)
             clear_all_caches()
             
             print("[CRON] Avvio pre-warming della cache in background...")
@@ -437,13 +437,10 @@ def get_dashboard_data_cached(filtro_tempo: str):
     else:
         df_hot_cmd = pd.DataFrame(columns=['comandante', 'cnt1', 'cnt2', 'delta'])
 
-    # --- INIZIO NUOVA LOGICA OTTIMIZZATA PER IL TREND DELLE CARTE ---
     if prev_cond:
         where_curr = base_where.replace('data_aggiornamento', 'd.data_aggiornamento')
         where_prev = "WHERE " + prev_cond.replace('data_aggiornamento', 'd.data_aggiornamento')
         
-        # Usiamo le funzioni finestra (Window Functions) di SQLite per calcolare i rank
-        # direttamente nel database ed estrarre solo la top 250 con il trend calcolato.
         q_top_cards = f"""
             WITH curr AS (
                 SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq,
@@ -477,7 +474,6 @@ def get_dashboard_data_cached(filtro_tempo: str):
             LIMIT 250
         """
         df_top_cards = pd.read_sql(q_top_cards, conn)
-    # --- FINE NUOVA LOGICA ---
 
     q_hc1 = """
         SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt1 

@@ -32,7 +32,6 @@ def init_db(db_path):
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS decks (
             id_moxfield TEXT PRIMARY KEY,
-            nome_mazzo TEXT,
             comandante TEXT,
             data_aggiornamento TEXT
         )
@@ -52,7 +51,6 @@ def scarica_singolo_mazzo(deck_base, retries=3):
     time.sleep(random.uniform(0.6, 1.5))
     
     deck_id = deck_base.get("publicId")
-    deck_name = deck_base.get("name")
     detail_url = f"https://api.moxfield.com/v2/decks/all/{deck_id}"
 
     for attempt in range(retries):
@@ -79,7 +77,7 @@ def scarica_singolo_mazzo(deck_base, retries=3):
                         if c_name:
                             comandanti_nomi.append(c_name)
 
-                # NOVITÀ: Ordina alfabeticamente la lista dei comandanti (per i Partner) prima di unirla
+                # Ordina alfabeticamente la lista dei comandanti (per i Partner) prima di unirla
                 if comandanti_nomi:
                     comandanti_nomi.sort()
                     
@@ -98,7 +96,6 @@ def scarica_singolo_mazzo(deck_base, retries=3):
 
                 return {
                     "id_moxfield": deck_id,
-                    "nome_mazzo": deck_name,
                     "comandante": comandante_nome,
                     "data_aggiornamento": data_aggiornamento,
                     "carte": list(carte_unigne_mazzo)
@@ -135,15 +132,15 @@ def run_scraper():
                 deck_id = mazzo.get("id_moxfield")
                 cmd_name = mazzo.get("comandante", "Sconosciuto")
                 
-                # NOVITÀ: Riordina alfabeticamente i Partner anche dal JSON storico
+                # Riordina alfabeticamente i Partner anche dal JSON storico
                 if cmd_name and " / " in cmd_name and " // " not in cmd_name:
                     parts = [p.strip() for p in cmd_name.split(" / ")]
                     parts.sort()
                     cmd_name = " / ".join(parts)
                 
                 cursor.execute(
-                    "INSERT OR REPLACE INTO decks (id_moxfield, nome_mazzo, comandante, data_aggiornamento) VALUES (?, ?, ?, ?)",
-                    (deck_id, mazzo.get("nome_mazzo"), cmd_name, mazzo.get("data_aggiornamento"))
+                    "INSERT OR REPLACE INTO decks (id_moxfield, comandante, data_aggiornamento) VALUES (?, ?, ?)",
+                    (deck_id, cmd_name, mazzo.get("data_aggiornamento"))
                 )
                 for carta in set(mazzo.get("carte", [])):
                     cursor.execute("INSERT INTO deck_cards (deck_id, card_name) VALUES (?, ?)", (deck_id, carta))
@@ -207,8 +204,8 @@ def run_scraper():
     
     for mazzo in database_pulito:
         cursor.execute(
-            "INSERT OR REPLACE INTO decks (id_moxfield, nome_mazzo, comandante, data_aggiornamento) VALUES (?, ?, ?, ?)",
-            (mazzo["id_moxfield"], mazzo["nome_mazzo"], mazzo["comandante"], mazzo["data_aggiornamento"])
+            "INSERT OR REPLACE INTO decks (id_moxfield, comandante, data_aggiornamento) VALUES (?, ?, ?)",
+            (mazzo["id_moxfield"], mazzo["comandante"], mazzo["data_aggiornamento"])
         )
         for carta in mazzo["carte"]:
             cursor.execute(

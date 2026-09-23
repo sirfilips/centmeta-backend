@@ -120,8 +120,12 @@ app = FastAPI(title="CentMeta API", version="3.4", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "https://centmeta.it",
+        "https://www.centmeta.it",
+        "http://localhost:3000"
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -838,16 +842,6 @@ def get_commander_decks_cached(comandante: str, filtro_tempo: str, limit: int = 
             "data_aggiornamento": row['data_aggiornamento']
         })
     return decks
-
-@app.post("/api/admin/update-db")
-async def force_update_db():
-    try:
-        await run_in_threadpool(master_scraper.run_scraper)
-        clear_all_caches()
-        await run_in_threadpool(get_decks_stats_cached, "Tutti i tempi", None, 0, 0)
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/commanders")
 async def get_commanders(filtro_tempo: str = "Tutti i tempi"):

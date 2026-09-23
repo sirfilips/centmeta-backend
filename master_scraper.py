@@ -2,10 +2,8 @@ import os
 import json
 import sqlite3
 import time
-import random
-import concurrent.futures
-import cloudscraper
 import logging
+import requests
 
 # Inizializza i percorsi base
 cartella_script = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +21,22 @@ logging.basicConfig(
     ]
 )
 
-# Inizializza lo scraper per superare le protezioni anti-bot
-scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+# Inizializza la sessione HTTP globale e lo stato del rate limiter
+session = requests.Session()
+last_request_time = 0.0
+
+def rate_limited_get(url, params=None, timeout=15):
+    """
+    Esegue una richiesta GET garantendo che passino almeno 1.2 secondi
+    dall'inizio della richiesta precedente.
+    """
+    global last_request_time
+    current_time = time.monotonic()
+    elapsed = current_time - last_request_time
+    if elapsed < 1.2:
+        time.sleep(1.2 - elapsed)
+    last_request_time = time.monotonic()
+    return session.get(url, params=params, timeout=timeout)
 
 def init_db(db_path):
     conn = sqlite3.connect(db_path)
@@ -47,18 +59,17 @@ def init_db(db_path):
     conn.commit()
     conn.close()
 
-def scarica_singolo_mazzo(deck_base, retries=3):
-    time.sleep(random.uniform(0.6, 1.5))
-    
+def scarica_singolo_mazzo(deck_base):
     deck_id = deck_base.get("publicId")
     detail_url = f"https://api.moxfield.com/v2/decks/all/{deck_id}"
 
-    for attempt in range(retries):
+    # Massimo 1 tentativo iniziale + 3 retry
+    for attempt in range(4):
         try:
-            detail_response = scraper.get(detail_url, timeout=15)
+            response = rate_limited_get(detail_url, timeout=15)
             
-            if detail_response.status_code == 200:
-                deck_dettagliato = detail_response.json()
+            if response.status_code == 200:
+                deck_dettagliato = response.json()
                 
                 comandanti_nomi = []
                 boards = deck_dettagliato.get("boards", {})
@@ -101,20 +112,41 @@ def scarica_singolo_mazzo(deck_base, retries=3):
                     "carte": list(carte_unigne_mazzo)
                 }
                 
-            elif detail_response.status_code == 429:
-                wait_time = (attempt + 1) * 3
-                logging.warning(f"Rilevato 429 per mazzo {deck_id}. Attesa di {wait_time}s (Tentativo {attempt+1}/{retries})")
+            elif response.status_code == 429:
+                if attempt == 0: wait_time = 10
+                elif attempt == 1: wait_time = 30
+                elif attempt == 2: wait_time = 60
+                else:
+                    logging.error(f"Mazzo {deck_id} saltato: esauriti i tentativi per 429.")
+                    break
+                logging.warning(f"Rilevato 429 per mazzo {deck_id}. Attesa di {wait_time}s")
                 time.sleep(wait_time)
             else:
-                logging.error(f"Errore {detail_response.status_code} per mazzo {deck_id}")
-                break
+                logging.warning(f"Errore {response.status_code} per mazzo {deck_id}")
+                if attempt < 3:
+                    time.sleep(5)
+                else:
+                    logging.error(f"Mazzo {deck_id} saltato: esauriti i tentativi per errore di stato.")
+                    break
         except Exception as e:
-            logging.error(f"Eccezione durante il download del mazzo {deck_id}: {e}")
-            time.sleep(2)
-            
+            logging.warning(f"Eccezione {type(e).__name__} per mazzo {deck_id}")
+            if attempt < 3:
+                time.sleep(5)
+            else:
+                logging.error(f"Mazzo {deck_id} saltato: esauriti i tentativi per eccezione di rete.")
+                break
+                
     return None
 
 def run_scraper():
+    # Verifica e impostazione dello User-Agent obbligatorio
+    ua = os.environ.get("MOXFIELD_UA")
+    if not ua:
+        logging.error("Variabile d'ambiente MOXFIELD_UA non impostata")
+        return
+        
+    session.headers.update({"User-Agent": ua})
+    
     init_db(db_path)
 
     if os.path.exists(json_path):
@@ -150,7 +182,7 @@ def run_scraper():
             logging.info(f"Conversione completata! {len(database_pulito)} mazzi importati nel DB locale.")
             return
         except Exception as e:
-            logging.error(f"Errore nella lettura del JSON: {e}. Procedo con il download web...")
+            logging.error(f"Errore nella lettura del JSON: {type(e).__name__}. Procedo con il download web...")
 
     logging.info("Cerco i mazzi per CentMeta su Moxfield...")
     search_url = "https://api.moxfield.com/v2/decks/search"
@@ -158,42 +190,62 @@ def run_scraper():
     page = 1
     page_size = 50
     decks = []
+    search_failed = False
 
     while True:
         params = {"pageNumber": page, "pageSize": page_size, "fmt": "centurion"}
-        try:
-            response = scraper.get(search_url, params=params, timeout=10)
-            if response.status_code == 429:
-                logging.warning("Rilevato rallentamento (429) durante la ricerca. Attendo 10 secondi...")
-                time.sleep(10)
-                continue
-            if response.status_code != 200:
-                logging.warning(f"Errore {response.status_code} alla pagina {page}. Riprovo tra 5 sec...")
-                time.sleep(5)
-                continue
-                
-            data = response.json().get("data", [])
-            if not data:
-                break
-                
-            decks.extend(data)
-            logging.info(f"Raccolti link pagina {page} (Totale mazzi in coda: {len(decks)})...")
-            page += 1
-            time.sleep(1.0)
-        except Exception as e:
-            logging.error(f"Errore di rete nella paginazione: {e}")
-            time.sleep(5)
+        success = False
+        
+        # Massimo 1 tentativo iniziale + 3 retry
+        for attempt in range(4):
+            try:
+                response = rate_limited_get(search_url, params=params, timeout=10)
+                if response.status_code == 200:
+                    success = True
+                    break
+                elif response.status_code == 429:
+                    if attempt == 0: wait_time = 10
+                    elif attempt == 1: wait_time = 30
+                    elif attempt == 2: wait_time = 60
+                    else: break
+                    logging.warning(f"Rilevato 429 durante la ricerca alla pagina {page}. Attesa di {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    logging.warning(f"Errore {response.status_code} alla pagina {page}")
+                    if attempt < 3:
+                        time.sleep(5)
+            except Exception as e:
+                logging.warning(f"Eccezione {type(e).__name__} alla pagina {page}")
+                if attempt < 3:
+                    time.sleep(5)
+                    
+        if not success:
+            logging.error(f"Ricerca fallita definitivamente alla pagina {page}.")
+            search_failed = True
+            break
+            
+        data = response.json().get("data", [])
+        if not data:
+            break
+            
+        decks.extend(data)
+        logging.info(f"Raccolti link pagina {page} (Totale mazzi in coda: {len(decks)})...")
+        page += 1
 
-    logging.info(f"Trovati {len(decks)} mazzi. Avvio il download parallelo bilanciato (4 worker)...")
+    # Interrompe l'aggiornamento senza toccare il database locale in caso di errore di paginazione
+    if search_failed:
+        logging.error("Fase di ricerca fallita. Interruzione senza modificare il database.")
+        return
+
+    logging.info(f"Trovati {len(decks)} mazzi. Avvio il download sequenziale...")
     
     database_pulito = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        results = executor.map(scarica_singolo_mazzo, decks)
-        for i, mazzo in enumerate(results):
-            if mazzo:
-                database_pulito.append(mazzo)
-            if (i + 1) % 100 == 0:
-                logging.info(f"Progresso: {i + 1}/{len(decks)} mazzi elaborati...")
+    for i, deck in enumerate(decks):
+        mazzo = scarica_singolo_mazzo(deck)
+        if mazzo:
+            database_pulito.append(mazzo)
+        if (i + 1) % 100 == 0:
+            logging.info(f"Progresso: {i + 1}/{len(decks)} mazzi elaborati...")
 
     logging.info("Salvataggio nel database SQLite in corso...")
     conn = sqlite3.connect(db_path)

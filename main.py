@@ -91,9 +91,9 @@ async def background_db_updater():
             print(f"[CRON] Prossimo aggiornamento alle 23:00 (tra {int(seconds_to_wait / 3600)} ore).")
             
             await asyncio.sleep(seconds_to_wait)
-            print("[CRON] Avvio aggiornamento giornaliero del database (Sospeso per ToS Moxfield)...")
+            print("[CRON] Avvio aggiornamento giornaliero del database...")
             
-            # await run_in_threadpool(master_scraper.run_scraper)
+            await run_in_threadpool(master_scraper.run_scraper)
             clear_all_caches()
             
             print("[CRON] Avvio pre-warming della cache in background...")

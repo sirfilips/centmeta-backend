@@ -15,6 +15,7 @@ cloudflared-linux-amd64.deb
 
 # Variabili d'ambiente
 .env
+.env.*
 
 # Ignora il frontend (gestito in un repository separato)
 frontend/

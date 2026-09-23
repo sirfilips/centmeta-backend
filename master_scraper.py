@@ -231,6 +231,7 @@ def run_scraper():
         decks.extend(data)
         logging.info(f"Raccolti link pagina {page} (Totale mazzi in coda: {len(decks)})...")
         page += 1
+        time.sleep(3.0)  # Pausa specifica per non stressare l'API di ricerca
 
     # Interrompe l'aggiornamento senza toccare il database locale in caso di errore di paginazione
     if search_failed:

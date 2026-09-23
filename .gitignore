@@ -1,0 +1,20 @@
+# Cache e Ambienti Virtuali Python
+__pycache__/
+venv/
+
+# Database (Dati di produzione)
+centurion.db
+
+# Cache temporanee e File di Log
+scryfall_cache.json
+scraper.log
+
+# Pacchetti scaricati e file di sistema
+cloudflared-linux-amd64.deb
+*.deb
+
+# Variabili d'ambiente
+.env
+
+# Ignora il frontend (gestito in un repository separato)
+frontend/

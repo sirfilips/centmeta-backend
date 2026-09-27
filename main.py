@@ -15,7 +15,8 @@ from functools import lru_cache
 import master_scraper
 
 scryfall_session = requests.Session()
-scryfall_session.headers.update({"User-Agent": "CentMeta/1.0"})
+# AGGIORNATO L'USER-AGENT COME DA POLICY SCRYFALL
+scryfall_session.headers.update({"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"})
 
 def sanitize_commanders_in_db():
     """Uniforma in ordine alfabetico i comandanti Partner per evitare sdoppiamenti, ignorando le carte bifronte (//)."""
@@ -361,6 +362,9 @@ def get_valid_commanders_set(filtro_tempo: str):
         seen_images = set()
         seen_art_crops = set()
         
+        # AGGIUNTA PER RECUPERARE LA COLOR IDENTITY DEL COMANDANTE
+        cmd_color_identity = set()
+        
         for part in parts:
             clean_key = part.lower()
             info = scryfall_cache.get(clean_key, {})
@@ -376,6 +380,10 @@ def get_valid_commanders_set(filtro_tempo: str):
                 if ac not in seen_art_crops: seen_art_crops.add(ac); art_crops.append(ac)
             for oracle in info.get("oracles", []):
                 if oracle not in oracles: oracles.append(oracle)
+                
+            # Combina la color identity di tutti i pezzi del comandante (utile per i Partner)
+            for c in info.get("color_identity", []):
+                cmd_color_identity.add(c)
         
         t_val = row.get('trend')
         if pd.isna(t_val):
@@ -391,7 +399,8 @@ def get_valid_commanders_set(filtro_tempo: str):
                 "trend": trend_out,
                 "images": images,
                 "art_crops": art_crops,
-                "oracles": oracles
+                "oracles": oracles,
+                "color_identity": list(cmd_color_identity) # Manda i colori al frontend
             })
             
     return frozenset(valid_set), result_list
@@ -526,9 +535,12 @@ def get_dashboard_data_cached(filtro_tempo: str):
             parts = [name.split(" // ")[0].strip()]
 
         images = []
+        cmd_colors = set()
         for part in parts:
             info = scryfall_cache.get(part.lower(), {})
             images.extend(info.get("images", []))
+            if is_cmd:
+                for c in info.get("color_identity", []): cmd_colors.add(c)
             
         seen = set()
         images = [x for x in images if not (x in seen or seen.add(x))]
@@ -541,6 +553,9 @@ def get_dashboard_data_cached(filtro_tempo: str):
         
         main_info = scryfall_cache.get(parts[0].lower(), {})
         cat = categorizza_tipo(main_info.get("type", "")) if not is_cmd else "Comandante"
+        
+        # AGGIUNTA COLOR IDENTITY ANCHE PER LA DASHBOARD HOT/TOP
+        final_color_identity = list(cmd_colors) if is_cmd else main_info.get("color_identity", [])
 
         return {
             "name": name,
@@ -549,7 +564,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
             "trend": trend_out,
             "delta": int(row.get('delta', 0)) if 'delta' in row else None,
             "category": cat,
-            "color_identity": main_info.get("color_identity", [])
+            "color_identity": final_color_identity
         }
 
     return {

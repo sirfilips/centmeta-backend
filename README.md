@@ -30,7 +30,7 @@ Per eseguire l'ambiente di sviluppo in locale, è necessario:
 
 1. Clonare il repository:
 ```bash
-git clone [https://github.com/sirfilips/centmeta-backend.git](https://github.com/TUO_USERNAME/centmeta-backend.git)
+git clone https://github.com/sirfilips/centmeta-backend.git
 ```
 
 2. Accedere alla directory del progetto:

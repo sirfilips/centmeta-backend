@@ -105,23 +105,31 @@ async def background_health_pinger():
     """Esegue un ping ogni ora e salva il risultato, mantenendo solo le ultime 48 ore."""
     setup_health_db()
     
-    # URL leggeri per testare le API senza consumare risorse
-    endpoints = {
-        "moxfield": "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1",
-        "scryfall": "https://api.scryfall.com/catalog/card-names"
-    }
-
     while True:
         try:
             now = datetime.now().isoformat()
             conn = get_db()
             c = conn.cursor()
             
-            for service, url in endpoints.items():
+            # Recupera l'UA di Moxfield dalle variabili d'ambiente (fallback se non trovato)
+            moxfield_ua = os.getenv("MOXFIELD_UA", "CentMeta/1.0 (privacy@centmeta.it)")
+            
+            # Configurazione dedicata e precisa per ciascun servizio
+            services_config = {
+                "moxfield": {
+                    "url": "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
+                    "headers": {"User-Agent": moxfield_ua}
+                },
+                "scryfall": {
+                    "url": "https://api.scryfall.com/catalog/card-names",
+                    "headers": {"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"}
+                }
+            }
+            
+            for service, config in services_config.items():
                 try:
-                    # Passiamo esplicitamente l'User-Agent per non farci bloccare da Scryfall
-                    headers = {"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"}
-                    res = requests.get(url, headers=headers, timeout=5)
+                    # Timeout leggermente allungato a 10s in caso di code Cloudflare
+                    res = requests.get(config["url"], headers=config["headers"], timeout=10)
                     
                     # Classifichiamo lo status
                     if res.status_code == 200:
@@ -130,7 +138,8 @@ async def background_health_pinger():
                         status = "rate_limited"
                     else:
                         status = "error"
-                except Exception:
+                except Exception as req_err:
+                    print(f"[HEALTH WARNING] Rilevata anomalia connessione {service}: {req_err}")
                     status = "down"
                     
                 c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, service, status))
@@ -149,7 +158,7 @@ async def background_health_pinger():
             print(f"[HEALTH] Ping orario completato alle {now}")
             
         except Exception as e:
-            print(f"[HEALTH ERROR] Errore nel loop di ping: {e}")
+            print(f"[HEALTH ERROR] Errore critico nel loop di ping: {e}")
             
         # Attendi esattamente un'ora (3600 secondi) prima del prossimo ping
         await asyncio.sleep(3600)

@@ -80,6 +80,80 @@ def clear_all_caches():
     get_dashboard_data_cached.cache_clear()
     print("[CACHE] Tutte le cache in memoria sono state svuotate.")
 
+def setup_health_db():
+    """Crea la tabella per lo storico dei ping se non esiste, e la blacklist GDPR."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS health_logs (
+            timestamp TEXT,
+            service TEXT,
+            status TEXT
+        )
+    ''')
+    # NUOVA TABELLA PER IL GDPR
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS blacklist (
+            id_moxfield TEXT PRIMARY KEY,
+            data_rimozione TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+async def background_health_pinger():
+    """Esegue un ping ogni ora e salva il risultato, mantenendo solo le ultime 48 ore."""
+    setup_health_db()
+    
+    # URL leggeri per testare le API senza consumare risorse
+    endpoints = {
+        "moxfield": "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1",
+        "scryfall": "https://api.scryfall.com/catalog/card-names"
+    }
+
+    while True:
+        try:
+            now = datetime.now().isoformat()
+            conn = get_db()
+            c = conn.cursor()
+            
+            for service, url in endpoints.items():
+                try:
+                    # Passiamo esplicitamente l'User-Agent per non farci bloccare da Scryfall
+                    headers = {"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"}
+                    res = requests.get(url, headers=headers, timeout=5)
+                    
+                    # Classifichiamo lo status
+                    if res.status_code == 200:
+                        status = "operational"
+                    elif res.status_code == 429:
+                        status = "rate_limited"
+                    else:
+                        status = "error"
+                except Exception:
+                    status = "down"
+                    
+                c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, service, status))
+                
+                # Pulizia automatica: manteniamo solo gli ultimi 48 ping per servizio per non intasare il DB
+                c.execute(f"""
+                    DELETE FROM health_logs 
+                    WHERE rowid NOT IN (
+                        SELECT rowid FROM health_logs 
+                        WHERE service=? ORDER BY timestamp DESC LIMIT 48
+                    )
+                """, (service,))
+            
+            conn.commit()
+            conn.close()
+            print(f"[HEALTH] Ping orario completato alle {now}")
+            
+        except Exception as e:
+            print(f"[HEALTH ERROR] Errore nel loop di ping: {e}")
+            
+        # Attendi esattamente un'ora (3600 secondi) prima del prossimo ping
+        await asyncio.sleep(3600)
+
 async def background_db_updater():
     while True:
         try:
@@ -114,8 +188,10 @@ async def lifespan(app: FastAPI):
     sanitize_commanders_in_db()
     setup_database_indices()
     updater_task = asyncio.create_task(background_db_updater())
+    health_task = asyncio.create_task(background_health_pinger())
     yield
     updater_task.cancel()
+    health_task.cancel()
 
 app = FastAPI(title="CentMeta API", version="3.4", lifespan=lifespan)
 
@@ -874,3 +950,69 @@ async def get_commander_decks(comandante: str, filtro_tempo: str = "Tutti i temp
 @app.get("/api/home/dashboard")
 async def get_dashboard(filtro_tempo: str = "Tutti i tempi"):
     return await run_in_threadpool(get_dashboard_data_cached, filtro_tempo)
+
+@app.get("/api/health")
+async def get_health_status():
+    """Restituisce lo stato attuale e lo storico per creare i rettangolini."""
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Recupera l'ultimo aggiornamento reale del database mazzi
+    try:
+        mtime = os.path.getmtime(DB_PATH)
+        db_last_updated = datetime.fromtimestamp(mtime).isoformat()
+    except Exception:
+        db_last_updated = None
+
+    history = {"moxfield": [], "scryfall": []}
+    
+    try:
+        # Prendi i log in ordine cronologico (dal più vecchio al più recente)
+        c.execute("SELECT service, status, timestamp FROM health_logs ORDER BY timestamp ASC")
+        for row in c.fetchall():
+            service = row['service']
+            if service in history:
+                history[service].append({
+                    "status": row['status'],
+                    "timestamp": row['timestamp']
+                })
+    except Exception:
+        pass
+    finally:
+        conn.close()
+        
+    return {
+        "db_last_updated": db_last_updated,
+        "history": history
+    }
+
+@app.delete("/api/admin/remove-deck/{deck_id}")
+async def remove_deck(deck_id: str, secret: str):
+    """Rimuove un mazzo da CentMeta e lo inserisce in blacklist per GDPR"""
+    # Recupera la password segreta dall'ambiente
+    admin_password = os.getenv("ADMIN_SECRET")
+    
+    # Blocca se la password non è configurata sul server o se è errata
+    if not admin_password or secret != admin_password:
+        raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
+        
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        # 1. Rimuovi le carte del mazzo
+        c.execute("DELETE FROM deck_cards WHERE deck_id = ?", (deck_id,))
+        # 2. Rimuovi il mazzo
+        c.execute("DELETE FROM decks WHERE id_moxfield = ?", (deck_id,))
+        # 3. Aggiungi alla blacklist per ignorarlo nei futuri scraping
+        now = datetime.now().isoformat()
+        c.execute("INSERT OR IGNORE INTO blacklist (id_moxfield, data_rimozione) VALUES (?, ?)", (deck_id, now))
+        conn.commit()
+        
+        # Svuota la cache in memoria per aggiornare il sito istantaneamente
+        clear_all_caches()
+        
+        return {"status": "success", "message": f"Mazzo {deck_id} rimosso e aggiunto alla blacklist."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()

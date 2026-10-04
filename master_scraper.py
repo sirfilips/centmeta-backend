@@ -54,6 +54,12 @@ def init_db(db_path):
             card_name TEXT
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS blacklist (
+            id_moxfield TEXT PRIMARY KEY,
+            data_rimozione TEXT
+        )
+    ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_card_name ON deck_cards(card_name)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_comandante ON decks(comandante)')
     conn.commit()
@@ -184,6 +190,17 @@ def run_scraper():
         except Exception as e:
             logging.error(f"Errore nella lettura del JSON: {type(e).__name__}. Procedo con il download web...")
 
+    # Prima della ricerca, carichiamo in memoria la blacklist per essere super veloci
+    blacklisted_ids = set()
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id_moxfield FROM blacklist")
+        blacklisted_ids = {row[0] for row in cursor.fetchall()}
+        conn.close()
+    except Exception as e:
+        logging.warning(f"Non sono riuscito a leggere la blacklist, procedo normalmente. Dettagli: {e}")
+
     logging.info("Cerco i mazzi per CentMeta su Moxfield...")
     search_url = "https://api.moxfield.com/v2/decks/search"
     
@@ -242,6 +259,13 @@ def run_scraper():
     
     database_pulito = []
     for i, deck in enumerate(decks):
+        deck_id = deck.get("publicId")
+        
+        # CONTROLLO GDPR: Se il mazzo è nella blacklist, lo salta direttamente
+        if deck_id in blacklisted_ids:
+            logging.info(f"Mazzo {deck_id} ignorato (presente in blacklist GDPR).")
+            continue
+            
         mazzo = scarica_singolo_mazzo(deck)
         if mazzo:
             database_pulito.append(mazzo)

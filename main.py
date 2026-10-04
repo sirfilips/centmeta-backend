@@ -81,17 +81,10 @@ def clear_all_caches():
     print("[CACHE] Tutte le cache in memoria sono state svuotate.")
 
 def setup_health_db():
-    """Crea la tabella per lo storico dei ping se non esiste, e la blacklist GDPR."""
+    """Crea la tabella ping in health.db, e la blacklist GDPR in centurion.db."""
+    # 1. Blacklist nel DB principale (per lo scraper e le API)
     conn = get_db()
     c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS health_logs (
-            timestamp TEXT,
-            service TEXT,
-            status TEXT
-        )
-    ''')
-    # NUOVA TABELLA PER IL GDPR
     c.execute('''
         CREATE TABLE IF NOT EXISTS blacklist (
             id_moxfield TEXT PRIMARY KEY,
@@ -101,14 +94,29 @@ def setup_health_db():
     conn.commit()
     conn.close()
 
+    # 2. Health Logs nel DB separato (per non alterare l'orario di centurion.db)
+    h_conn = get_health_db()
+    h_c = h_conn.cursor()
+    h_c.execute('''
+        CREATE TABLE IF NOT EXISTS health_logs (
+            timestamp TEXT,
+            service TEXT,
+            status TEXT
+        )
+    ''')
+    h_conn.commit()
+    h_conn.close()
+
 async def background_health_pinger():
-    """Esegue un ping ogni ora e salva il risultato, mantenendo solo le ultime 48 ore."""
+    """Esegue un ping ogni ora e salva il risultato in health.db, mantenendo solo le ultime 48 ore."""
     setup_health_db()
     
     while True:
         try:
             now = datetime.now().isoformat()
-            conn = get_db()
+            
+            # Usiamo il database della salute per non toccare l'orario del db mazzi
+            conn = get_health_db()
             c = conn.cursor()
             
             # Recupera l'UA di Moxfield dalle variabili d'ambiente (fallback se non trovato)
@@ -144,14 +152,14 @@ async def background_health_pinger():
                     
                 c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, service, status))
                 
-                # Pulizia automatica: manteniamo solo gli ultimi 48 ping per servizio per non intasare il DB
-                c.execute(f"""
+                # Ora cancella solo i vecchi log di QUESTO servizio senza toccare gli altri
+                c.execute("""
                     DELETE FROM health_logs 
-                    WHERE rowid NOT IN (
+                    WHERE service=? AND rowid NOT IN (
                         SELECT rowid FROM health_logs 
                         WHERE service=? ORDER BY timestamp DESC LIMIT 48
                     )
-                """, (service,))
+                """, (service, service))
             
             conn.commit()
             conn.close()
@@ -218,12 +226,18 @@ app.add_middleware(
 
 CARTELLA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
+HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db") # NUOVO PERCORSO
 CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
 
 _SCRYFALL_CACHE_MEMORY = None
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def get_health_db():
+    conn = sqlite3.connect(HEALTH_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -963,10 +977,8 @@ async def get_dashboard(filtro_tempo: str = "Tutti i tempi"):
 @app.get("/api/health")
 async def get_health_status():
     """Restituisce lo stato attuale e lo storico per creare i rettangolini."""
-    conn = get_db()
-    c = conn.cursor()
     
-    # Recupera l'ultimo aggiornamento reale del database mazzi
+    # Leggiamo il vero e unico aggiornamento dal database mazzi principale
     try:
         mtime = os.path.getmtime(DB_PATH)
         db_last_updated = datetime.fromtimestamp(mtime).isoformat()
@@ -975,10 +987,14 @@ async def get_health_status():
 
     history = {"moxfield": [], "scryfall": []}
     
+    # Leggiamo i log dal database separato della salute
+    h_conn = get_health_db()
+    h_c = h_conn.cursor()
+    
     try:
         # Prendi i log in ordine cronologico (dal più vecchio al più recente)
-        c.execute("SELECT service, status, timestamp FROM health_logs ORDER BY timestamp ASC")
-        for row in c.fetchall():
+        h_c.execute("SELECT service, status, timestamp FROM health_logs ORDER BY timestamp ASC")
+        for row in h_c.fetchall():
             service = row['service']
             if service in history:
                 history[service].append({
@@ -988,7 +1004,7 @@ async def get_health_status():
     except Exception:
         pass
     finally:
-        conn.close()
+        h_conn.close()
         
     return {
         "db_last_updated": db_last_updated,
@@ -1005,6 +1021,7 @@ async def remove_deck(deck_id: str, secret: str):
     if not admin_password or secret != admin_password:
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
         
+    # Rimozione e blacklist avvengono SEMPRE nel DB principale
     conn = get_db()
     c = conn.cursor()
     try:

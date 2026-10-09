@@ -4,6 +4,7 @@ venv/
 
 # Database (Dati di produzione)
 centurion.db
+*.db
 
 # Cache temporanee e File di Log
 scryfall_cache.json

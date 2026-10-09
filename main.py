@@ -1,7 +1,6 @@
 import os
 import json
 import sqlite3
-import pandas as pd
 import requests
 import asyncio
 import time as std_time
@@ -9,22 +8,18 @@ from datetime import datetime, time, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from typing import Optional
+from typing import Optional, List
 from contextlib import asynccontextmanager
 from functools import lru_cache
 import master_scraper
 
 scryfall_session = requests.Session()
-# AGGIORNATO L'USER-AGENT COME DA POLICY SCRYFALL
 scryfall_session.headers.update({"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"})
 
 def sanitize_commanders_in_db():
-    """Uniforma in ordine alfabetico i comandanti Partner per evitare sdoppiamenti, ignorando le carte bifronte (//)."""
     conn = get_db()
     c = conn.cursor()
     try:
-        # Cerca i mazzi con Partner (che usano il singolo slash " / " con gli spazi)
-        # Escludiamo esplicitamente le carte bifronte che usano " // "
         c.execute("SELECT id_moxfield, comandante FROM decks WHERE comandante LIKE '% / %' AND comandante NOT LIKE '%//%'")
         rows = c.fetchall()
         updated_count = 0
@@ -32,15 +27,10 @@ def sanitize_commanders_in_db():
         for row in rows:
             deck_id = row['id_moxfield']
             commander_name = row['comandante']
-            
-            # Dividi i nomi dei Partner dal singolo slash, pulisci gli spazi e metti in ordine alfabetico
             parts = [part.strip() for part in commander_name.split(' / ')]
             parts.sort()
-            
-            # Riunisci usando lo STESSO delimitatore (spazio slash spazio)
             new_name = " / ".join(parts)
             
-            # Se il nome alfabetico è diverso da quello salvato, aggiorna il database
             if new_name != commander_name:
                 c.execute("UPDATE decks SET comandante = ? WHERE id_moxfield = ?", (new_name, deck_id))
                 updated_count += 1
@@ -64,7 +54,7 @@ def setup_database_indices():
         c.execute("CREATE INDEX IF NOT EXISTS idx_deck_cards_deck_id ON deck_cards(deck_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_deck_cards_card_name ON deck_cards(card_name)")
         conn.commit()
-        print("[DB] Indici ottimizzati con successo. Le query saranno molto più veloci.")
+        print("[DB] Indici ottimizzati con successo.")
     except Exception as e:
         print(f"[DB ERROR] Creazione indici fallita: {e}")
     finally:
@@ -81,8 +71,6 @@ def clear_all_caches():
     print("[CACHE] Tutte le cache in memoria sono state svuotate.")
 
 def setup_health_db():
-    """Crea la tabella ping in health.db, e la blacklist GDPR in centurion.db."""
-    # 1. Blacklist nel DB principale (per lo scraper e le API)
     conn = get_db()
     c = conn.cursor()
     c.execute('''
@@ -94,7 +82,6 @@ def setup_health_db():
     conn.commit()
     conn.close()
 
-    # 2. Health Logs nel DB separato (per non alterare l'orario di centurion.db)
     h_conn = get_health_db()
     h_c = h_conn.cursor()
     h_c.execute('''
@@ -108,21 +95,15 @@ def setup_health_db():
     h_conn.close()
 
 async def background_health_pinger():
-    """Esegue un ping ogni ora e salva il risultato in health.db, mantenendo solo le ultime 48 ore."""
     setup_health_db()
     
     while True:
         try:
             now = datetime.now().isoformat()
-            
-            # Usiamo il database della salute per non toccare l'orario del db mazzi
             conn = get_health_db()
             c = conn.cursor()
-            
-            # Recupera l'UA di Moxfield dalle variabili d'ambiente (fallback se non trovato)
             moxfield_ua = os.getenv("MOXFIELD_UA", "CentMeta/1.0 (privacy@centmeta.it)")
             
-            # Configurazione dedicata e precisa per ciascun servizio
             services_config = {
                 "moxfield": {
                     "url": "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
@@ -136,10 +117,7 @@ async def background_health_pinger():
             
             for service, config in services_config.items():
                 try:
-                    # Timeout leggermente allungato a 10s in caso di code Cloudflare
                     res = requests.get(config["url"], headers=config["headers"], timeout=10)
-                    
-                    # Classifichiamo lo status
                     if res.status_code == 200:
                         status = "operational"
                     elif res.status_code == 429:
@@ -152,7 +130,6 @@ async def background_health_pinger():
                     
                 c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, service, status))
                 
-                # Ora cancella solo i vecchi log di QUESTO servizio senza toccare gli altri
                 c.execute("""
                     DELETE FROM health_logs 
                     WHERE service=? AND rowid NOT IN (
@@ -168,8 +145,25 @@ async def background_health_pinger():
         except Exception as e:
             print(f"[HEALTH ERROR] Errore critico nel loop di ping: {e}")
             
-        # Attendi esattamente un'ora (3600 secondi) prima del prossimo ping
         await asyncio.sleep(3600)
+
+async def warmup_caches(periodi: Optional[List[str]] = None):
+    """Esegue il pre-warming della cache. Se non specificato, scalda tutti i periodi."""
+    if periodi is None:
+        periodi = [
+            "Ultimi 7 giorni",
+            "Ultimi 30 giorni",
+            "Ultimi 3 mesi",
+            "Ultimi 6 mesi",
+            "Ultimo anno",
+            "Tutti i tempi"
+        ]
+    print(f"[WARMUP] Avvio pre-warming per {len(periodi)} periodo/i: {', '.join(periodi)}...")
+    for periodo in periodi:
+        print(f"[WARMUP] Costruzione cache per: {periodo}...")
+        await run_in_threadpool(get_decks_stats_cached, periodo, None, 0, 0)
+        await run_in_threadpool(get_dashboard_data_cached, periodo)
+    print("[WARMUP] Pre-warming completato. Sistema pronto.")
 
 async def background_db_updater():
     while True:
@@ -188,10 +182,8 @@ async def background_db_updater():
             await run_in_threadpool(master_scraper.run_scraper)
             clear_all_caches()
             
-            print("[CRON] Avvio pre-warming della cache in background...")
-            await run_in_threadpool(get_decks_stats_cached, "Tutti i tempi", None, 0, 0)
-            await run_in_threadpool(get_dashboard_data_cached, "Tutti i tempi")
-            print("[CRON] Pre-warming completato. Sistema pronto e veloce!")
+            # Alle 23:00 scalda tutti i periodi
+            await warmup_caches()
             
         except asyncio.CancelledError:
             break
@@ -201,12 +193,23 @@ async def background_db_updater():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Esegue la pulizia automatica dei Partner prima di tutto il resto
     sanitize_commanders_in_db()
     setup_database_indices()
+    
     updater_task = asyncio.create_task(background_db_updater())
     health_task = asyncio.create_task(background_health_pinger())
-    yield
+    
+    # Pre-caching in background all'avvio solo per il periodo di default (30 giorni)
+    async def deferred_warmup():
+        await asyncio.sleep(2)  # Permette a Uvicorn di aprire la porta e accettare connessioni subito
+        await warmup_caches(["Ultimi 30 giorni"])
+
+    warmup_task = asyncio.create_task(deferred_warmup())
+
+    yield  # <-- Il server apre la porta ORA ed è subito accessibile
+
+    if warmup_task:
+        warmup_task.cancel()
     updater_task.cancel()
     health_task.cancel()
 
@@ -226,7 +229,7 @@ app.add_middleware(
 
 CARTELLA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
-HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db") # NUOVO PERCORSO
+HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db")
 CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
 
 _SCRYFALL_CACHE_MEMORY = None
@@ -415,39 +418,41 @@ def categorizza_tipo(type_line):
 @lru_cache(maxsize=32)
 def get_valid_commanders_set(filtro_tempo: str):
     conn = get_db()
+    c = conn.cursor()
     curr_cond, prev_cond = get_time_conditions_both(filtro_tempo)
     base_where = f"WHERE {curr_cond}" if curr_cond else ""
     
     q_curr = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC"
-    df_curr = pd.read_sql(q_curr, conn)
+    curr_rows = c.execute(q_curr).fetchall()
     
-    if not df_curr.empty:
-        df_curr['rank_curr'] = df_curr['cnt'].rank(method='first', ascending=False)
-        
     if prev_cond:
         q_prev = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {prev_cond} GROUP BY comandante ORDER BY cnt DESC"
-        df_prev = pd.read_sql(q_prev, conn)
-        if not df_prev.empty:
-            df_prev['rank_prev'] = df_prev['cnt'].rank(method='first', ascending=False)
-            df_curr = pd.merge(df_curr, df_prev[['comandante', 'rank_prev']], on='comandante', how='left')
-            df_curr['trend'] = df_curr['rank_prev'] - df_curr['rank_curr']
-        else:
-            df_curr['trend'] = None
+        prev_rows = c.execute(q_prev).fetchall()
+        prev_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_rows)}
+        
+        df_curr = []
+        for idx, r in enumerate(curr_rows):
+            cmd = r['comandante']
+            if cmd in prev_ranks:
+                trend = prev_ranks[cmd] - (idx + 1)
+            else:
+                trend = None
+            df_curr.append({'comandante': cmd, 'cnt': r['cnt'], 'trend': trend})
     else:
-        df_curr['trend'] = ""
+        df_curr = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_rows]
 
     conn.close()
     
-    if df_curr.empty:
+    if not df_curr:
         return frozenset(), []
         
-    cmd_names = df_curr['comandante'].tolist()
+    cmd_names = [row['comandante'] for row in df_curr]
     scryfall_cache = fetch_scryfall_data(cmd_names)
     
     valid_set = set()
     result_list = []
     
-    for _, row in df_curr.iterrows():
+    for row in df_curr:
         name = row['comandante']
         parts = []
         if " / " in name: parts = [p.strip() for p in name.split(" / ")]
@@ -460,8 +465,6 @@ def get_valid_commanders_set(filtro_tempo: str):
         oracles = []
         seen_images = set()
         seen_art_crops = set()
-        
-        # AGGIUNTA PER RECUPERARE LA COLOR IDENTITY DEL COMANDANTE
         cmd_color_identity = set()
         
         for part in parts:
@@ -480,12 +483,11 @@ def get_valid_commanders_set(filtro_tempo: str):
             for oracle in info.get("oracles", []):
                 if oracle not in oracles: oracles.append(oracle)
                 
-            # Combina la color identity di tutti i pezzi del comandante (utile per i Partner)
-            for c in info.get("color_identity", []):
-                cmd_color_identity.add(c)
+            for color in info.get("color_identity", []):
+                cmd_color_identity.add(color)
         
-        t_val = row.get('trend')
-        if pd.isna(t_val):
+        t_val = row['trend']
+        if t_val is None:
             trend_out = None if prev_cond else ""
         else:
             trend_out = int(t_val) if t_val != "" else ""
@@ -499,7 +501,7 @@ def get_valid_commanders_set(filtro_tempo: str):
                 "images": images,
                 "art_crops": art_crops,
                 "oracles": oracles,
-                "color_identity": list(cmd_color_identity) # Manda i colori al frontend
+                "color_identity": list(cmd_color_identity)
             })
             
     return frozenset(valid_set), result_list
@@ -507,81 +509,74 @@ def get_valid_commanders_set(filtro_tempo: str):
 @lru_cache(maxsize=32)
 def get_dashboard_data_cached(filtro_tempo: str):
     conn = get_db()
+    c = conn.cursor()
     curr_cond, prev_cond = get_time_conditions_both(filtro_tempo)
     base_where = f"WHERE {curr_cond}" if curr_cond else ""
     
-    q_tot = f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {base_where}"
-    tot_decks = int(pd.read_sql(q_tot, conn).iloc[0]['tot'])
+    tot_decks = c.execute(f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {base_where}").fetchone()['tot']
 
     q_curr_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC"
-    df_curr_cmd = pd.read_sql(q_curr_cmd, conn)
-    if not df_curr_cmd.empty:
-        df_curr_cmd['rank_curr'] = df_curr_cmd['cnt'].rank(method='first', ascending=False)
+    curr_cmd_rows = c.execute(q_curr_cmd).fetchall()
     
     if prev_cond:
         q_prev_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {prev_cond} GROUP BY comandante ORDER BY cnt DESC"
-        df_prev_cmd = pd.read_sql(q_prev_cmd, conn)
-        if not df_prev_cmd.empty:
-            df_prev_cmd['rank_prev'] = df_prev_cmd['cnt'].rank(method='first', ascending=False)
-            df_top_cmd = pd.merge(df_curr_cmd.head(25), df_prev_cmd[['comandante', 'rank_prev']], on='comandante', how='left')
-            df_top_cmd['trend'] = df_top_cmd['rank_prev'] - df_top_cmd['rank_curr']
-        else:
-            df_top_cmd = df_curr_cmd.head(25)
-            df_top_cmd['trend'] = None
+        prev_cmd_rows = c.execute(q_prev_cmd).fetchall()
+        prev_cmd_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_cmd_rows)}
+        
+        df_top_cmd = []
+        for idx, r in enumerate(curr_cmd_rows[:25]):
+            cmd = r['comandante']
+            trend = prev_cmd_ranks.get(cmd, idx + 1) - (idx + 1) if cmd in prev_cmd_ranks else None
+            df_top_cmd.append({'comandante': cmd, 'cnt': r['cnt'], 'trend': trend})
     else:
-        df_top_cmd = df_curr_cmd.head(25) if not df_curr_cmd.empty else pd.DataFrame(columns=['comandante', 'cnt'])
-        df_top_cmd['trend'] = ""
+        df_top_cmd = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_cmd_rows[:25]]
 
     q_p1 = "SELECT comandante, COUNT(*) as cnt1 FROM decks WHERE datetime(data_aggiornamento) > datetime('now', '-7 days') GROUP BY comandante"
     q_p2 = "SELECT comandante, COUNT(*) as cnt2 FROM decks WHERE datetime(data_aggiornamento) <= datetime('now', '-7 days') AND datetime(data_aggiornamento) > datetime('now', '-14 days') GROUP BY comandante"
-    df_p1 = pd.read_sql(q_p1, conn)
-    df_p2 = pd.read_sql(q_p2, conn)
+    p1_rows = c.execute(q_p1).fetchall()
+    p2_rows = c.execute(q_p2).fetchall()
+    p2_dict = {r['comandante']: r['cnt2'] for r in p2_rows}
     
-    if not df_p1.empty:
-        df_hot_cmd = pd.merge(df_p1, df_p2, on='comandante', how='left').fillna(0)
-        df_hot_cmd['delta'] = df_hot_cmd['cnt1'] - df_hot_cmd['cnt2']
-        df_hot_cmd = df_hot_cmd[(df_hot_cmd['cnt1'] >= 2) & (df_hot_cmd['delta'] > 0)]
-        df_hot_cmd = df_hot_cmd.sort_values('delta', ascending=False).head(50)
-    else:
-        df_hot_cmd = pd.DataFrame(columns=['comandante', 'cnt1', 'cnt2', 'delta'])
+    df_hot_cmd = []
+    for r in p1_rows:
+        cmd = r['comandante']
+        cnt1 = r['cnt1']
+        cnt2 = p2_dict.get(cmd, 0)
+        delta = cnt1 - cnt2
+        if cnt1 >= 2 and delta > 0:
+            df_hot_cmd.append({'comandante': cmd, 'cnt1': cnt1, 'delta': delta})
+            
+    df_hot_cmd.sort(key=lambda x: x['delta'], reverse=True)
+    df_hot_cmd = df_hot_cmd[:50]
 
+    where_curr = base_where.replace('data_aggiornamento', 'd.data_aggiornamento') if base_where else ""
+    where_prev = f"WHERE {prev_cond.replace('data_aggiornamento', 'd.data_aggiornamento')}" if prev_cond else ""
+    
+    q_curr_cards = f"""
+        SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
+        FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
+        {where_curr}
+        GROUP BY c.card_name ORDER BY freq DESC
+    """
+    curr_card_rows = c.execute(q_curr_cards).fetchall()
+    
     if prev_cond:
-        where_curr = base_where.replace('data_aggiornamento', 'd.data_aggiornamento')
-        where_prev = "WHERE " + prev_cond.replace('data_aggiornamento', 'd.data_aggiornamento')
-        
-        q_top_cards = f"""
-            WITH curr AS (
-                SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq,
-                       ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT c.deck_id) DESC) as rank_curr
-                FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-                {where_curr}
-                GROUP BY c.card_name
-            ),
-            prev AS (
-                SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq,
-                       ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT c.deck_id) DESC) as rank_prev
-                FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-                {where_prev}
-                GROUP BY c.card_name
-            )
-            SELECT curr.card_name, curr.freq, (prev.rank_prev - curr.rank_curr) as trend
-            FROM curr
-            LEFT JOIN prev ON curr.card_name = prev.card_name
-            ORDER BY curr.freq DESC
-            LIMIT 250
-        """
-        df_top_cards = pd.read_sql(q_top_cards, conn)
-    else:
-        where_curr = base_where.replace('data_aggiornamento', 'd.data_aggiornamento') if base_where else ""
-        q_top_cards = f"""
-            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq, "" as trend
+        q_prev_cards = f"""
+            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
             FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-            {where_curr}
-            GROUP BY c.card_name
-            ORDER BY freq DESC
-            LIMIT 250
+            {where_prev}
+            GROUP BY c.card_name ORDER BY freq DESC
         """
-        df_top_cards = pd.read_sql(q_top_cards, conn)
+        prev_card_rows = c.execute(q_prev_cards).fetchall()
+        prev_card_ranks = {r['card_name']: idx + 1 for idx, r in enumerate(prev_card_rows)}
+        
+        df_top_cards = []
+        for idx, r in enumerate(curr_card_rows[:250]):
+            c_name = r['card_name']
+            trend = prev_card_ranks.get(c_name, idx + 1) - (idx + 1) if c_name in prev_card_ranks else None
+            df_top_cards.append({'card_name': c_name, 'freq': r['freq'], 'trend': trend})
+    else:
+        df_top_cards = [{'card_name': r['card_name'], 'freq': r['freq'], 'trend': ""} for r in curr_card_rows[:250]]
 
     q_hc1 = """
         SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt1 
@@ -593,16 +588,21 @@ def get_dashboard_data_cached(filtro_tempo: str):
         FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
         WHERE datetime(d.data_aggiornamento) <= datetime('now', '-7 days') AND datetime(d.data_aggiornamento) > datetime('now', '-14 days') GROUP BY c.card_name
     """
-    df_hc1 = pd.read_sql(q_hc1, conn)
-    df_hc2 = pd.read_sql(q_hc2, conn)
+    hc1_rows = c.execute(q_hc1).fetchall()
+    hc2_rows = c.execute(q_hc2).fetchall()
+    hc2_dict = {r['card_name']: r['cnt2'] for r in hc2_rows}
     
-    if not df_hc1.empty:
-        df_hot_c = pd.merge(df_hc1, df_hc2, on='card_name', how='left').fillna(0)
-        df_hot_c['delta'] = df_hot_c['cnt1'] - df_hot_c['cnt2']
-        df_hot_c = df_hot_c[(df_hot_c['cnt1'] >= 3) & (df_hot_c['delta'] > 0)]
-        df_hot_c = df_hot_c.sort_values('delta', ascending=False).head(250)
-    else:
-        df_hot_c = pd.DataFrame()
+    df_hot_c = []
+    for r in hc1_rows:
+        c_name = r['card_name']
+        cnt1 = r['cnt1']
+        cnt2 = hc2_dict.get(c_name, 0)
+        delta = cnt1 - cnt2
+        if cnt1 >= 3 and delta > 0:
+            df_hot_c.append({'card_name': c_name, 'cnt1': cnt1, 'delta': delta})
+            
+    df_hot_c.sort(key=lambda x: x['delta'], reverse=True)
+    df_hot_c = df_hot_c[:250]
         
     conn.close()
 
@@ -617,10 +617,10 @@ def get_dashboard_data_cached(filtro_tempo: str):
             else:
                 all_names.add(name.split(" // ")[0].strip())
 
-    if not df_top_cmd.empty: add_names(df_top_cmd['comandante'].tolist(), True)
-    if not df_hot_cmd.empty: add_names(df_hot_cmd['comandante'].tolist(), True)
-    if not df_top_cards.empty: add_names(df_top_cards['card_name'].tolist(), False)
-    if not df_hot_c.empty: add_names(df_hot_c['card_name'].tolist(), False)
+    add_names([r['comandante'] for r in df_top_cmd], True)
+    add_names([r['comandante'] for r in df_hot_cmd], True)
+    add_names([r['card_name'] for r in df_top_cards], False)
+    add_names([r['card_name'] for r in df_hot_c], False)
     
     scryfall_cache = fetch_scryfall_data(list(all_names))
 
@@ -639,13 +639,13 @@ def get_dashboard_data_cached(filtro_tempo: str):
             info = scryfall_cache.get(part.lower(), {})
             images.extend(info.get("images", []))
             if is_cmd:
-                for c in info.get("color_identity", []): cmd_colors.add(c)
+                for color in info.get("color_identity", []): cmd_colors.add(color)
             
         seen = set()
         images = [x for x in images if not (x in seen or seen.add(x))]
 
         t_val = row.get('trend')
-        if pd.isna(t_val):
+        if t_val is None:
             trend_out = None if prev_cond else ""
         else:
             trend_out = int(t_val) if t_val != "" else ""
@@ -653,7 +653,6 @@ def get_dashboard_data_cached(filtro_tempo: str):
         main_info = scryfall_cache.get(parts[0].lower(), {})
         cat = categorizza_tipo(main_info.get("type", "")) if not is_cmd else "Comandante"
         
-        # AGGIUNTA COLOR IDENTITY ANCHE PER LA DASHBOARD HOT/TOP
         final_color_identity = list(cmd_colors) if is_cmd else main_info.get("color_identity", [])
 
         return {
@@ -668,10 +667,10 @@ def get_dashboard_data_cached(filtro_tempo: str):
 
     return {
         "total_decks": tot_decks,
-        "top_commanders": [format_item(row, 'comandante', True) for _, row in df_top_cmd.iterrows()] if not df_top_cmd.empty else [],
-        "hot_commanders": [format_item(row, 'comandante', True) for _, row in df_hot_cmd.iterrows()] if not df_hot_cmd.empty else [],
-        "top_cards": [format_item(row, 'card_name', False) for _, row in df_top_cards.iterrows()] if not df_top_cards.empty else [],
-        "hot_cards": [format_item(row, 'card_name', False) for _, row in df_hot_c.iterrows()] if not df_hot_c.empty else []
+        "top_commanders": [format_item(row, 'comandante', True) for row in df_top_cmd],
+        "hot_commanders": [format_item(row, 'comandante', True) for row in df_hot_cmd],
+        "top_cards": [format_item(row, 'card_name', False) for row in df_top_cards],
+        "hot_cards": [format_item(row, 'card_name', False) for row in df_hot_c]
     }
 
 @lru_cache(maxsize=128)
@@ -683,14 +682,15 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
         global_last_updated = None
 
     conn = get_db()
+    c = conn.cursor()
     valid_commanders, _ = get_valid_commanders_set(filtro_tempo)
     if not valid_commanders:
         conn.close()
         return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
 
-    global_total = int(pd.read_sql("SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks", conn).iloc[0]['tot'])
-    global_cards = pd.read_sql("SELECT card_name, COUNT(DISTINCT deck_id) as g_freq FROM deck_cards GROUP BY card_name", conn)
-    global_cards['g_perc'] = (global_cards['g_freq'] / global_total * 100)
+    global_total = c.execute("SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks").fetchone()['tot']
+    gc_rows = c.execute("SELECT card_name, COUNT(DISTINCT deck_id) as g_freq FROM deck_cards GROUP BY card_name").fetchall()
+    global_cards = {r['card_name']: r['g_freq'] for r in gc_rows}
 
     conds = []
     t_cond = get_time_condition(filtro_tempo)
@@ -712,15 +712,14 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
     where_clause = " WHERE " + " AND ".join(conds)
     
     q_total = f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {where_clause}"
-    total_decks = int(pd.read_sql(q_total, conn, params=params).iloc[0]['tot'])
+    total_decks = c.execute(q_total, params).fetchone()['tot']
     
     if total_decks == 0:
         conn.close()
         return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
         
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(deck_cards)")
-    columns = [info[1].lower() for info in cursor.fetchall()]
+    c.execute("PRAGMA table_info(deck_cards)")
+    columns = [info[1].lower() for info in c.fetchall()]
     
     qty_col = None
     for col in ['qty', 'quantita', 'quantity', 'copies', 'copie']:
@@ -747,18 +746,33 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
             GROUP BY c.card_name
         """
         
-    stats_df = pd.read_sql(q_cards, conn, params=params)
+    stats_rows = c.execute(q_cards, params).fetchall()
     conn.close()
     
-    stats_df['Percentuale'] = (stats_df['freq'] / total_decks * 100).round(1)
+    stats_list = []
+    for row in stats_rows:
+        c_name = row['card_name']
+        freq = row['freq']
+        total_copies = row['total_copies'] if qty_col else None
+        
+        perc = round((freq / total_decks) * 100, 1)
+        g_freq = global_cards.get(c_name, 0)
+        g_perc = (g_freq / global_total) * 100
+        sinergia = round(perc - g_perc, 1)
+        
+        stats_list.append({
+            'card_name': c_name,
+            'freq': freq,
+            'total_copies': total_copies,
+            'Percentuale': perc,
+            'Sinergia': sinergia
+        })
+        
+    stats_list.sort(key=lambda x: (x['Percentuale'], x['freq']), reverse=True)
+    if limit > 0: 
+        stats_list = stats_list[offset : offset + limit]
     
-    stats_df = pd.merge(stats_df, global_cards[['card_name', 'g_perc']], on='card_name', how='left').fillna(0)
-    stats_df['Sinergia'] = (stats_df['Percentuale'] - stats_df['g_perc']).round(1)
-    
-    stats_df = stats_df.sort_values(by=['Percentuale', 'freq'], ascending=False)
-    if limit > 0: stats_df = stats_df.iloc[offset : offset + limit]
-    
-    scryfall_cache = fetch_scryfall_data(stats_df['card_name'].tolist())
+    scryfall_cache = fetch_scryfall_data([x['card_name'] for x in stats_list])
     
     formatted_cards = []
     mana_curve = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0}
@@ -766,7 +780,7 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
 
     somma_univoche = 0.0
 
-    for _, row in stats_df.iterrows():
+    for row in stats_list:
         c_name = row['card_name']
         info = scryfall_cache.get(c_name.lower(), {})
         if not info:
@@ -774,7 +788,7 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
             
         cat = categorizza_tipo(info.get("type", ""))
         
-        if 'total_copies' in row and pd.notna(row['total_copies']):
+        if row['total_copies'] is not None:
             avg_copies_comp = float(row['total_copies']) / total_decks
         else:
             avg_copies_comp = float(row['freq']) / total_decks
@@ -802,7 +816,7 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
             "category": cat
         })
         
-    if 'total_copies' not in stats_df.columns:
+    if not qty_col:
         terre_mancanti = 100.0 - somma_univoche
         if terre_mancanti > 0:
             type_dist["Terre"] += terre_mancanti
@@ -818,6 +832,7 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
 @lru_cache(maxsize=512)
 def get_card_details_cached(card_name: str, filtro_tempo: str):
     conn = get_db()
+    c = conn.cursor()
     valid_commanders, _ = get_valid_commanders_set(filtro_tempo)
     if not valid_commanders:
         conn.close()
@@ -832,10 +847,10 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
         time_filtered_cond = " AND " + t_cond.replace("data_aggiornamento", "d.data_aggiornamento")
 
     q_tot_glob = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ? AND d.comandante IN {placeholders_cmd}"
-    total_decks_global = int(pd.read_sql(q_tot_glob, conn, params=[card_name] + valid_cmd_list).iloc[0]['tot'])
+    total_decks_global = c.execute(q_tot_glob, [card_name] + valid_cmd_list).fetchone()['tot']
     
     q_tot_time = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ? AND d.comandante IN {placeholders_cmd} {time_filtered_cond}"
-    total_decks_time = int(pd.read_sql(q_tot_time, conn, params=[card_name] + valid_cmd_list).iloc[0]['tot'])
+    total_decks_time = c.execute(q_tot_time, [card_name] + valid_cmd_list).fetchone()['tot']
 
     scryfall_cache = load_scryfall_cache()
     if card_name.lower() not in scryfall_cache:
@@ -854,20 +869,31 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
         }
         
     q_cmd = f"SELECT d.comandante, COUNT(DISTINCT d.id_moxfield) as mazzi_carta FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ? AND d.comandante IN {placeholders_cmd} {time_filtered_cond} GROUP BY d.comandante"
-    cmd_counts = pd.read_sql(q_cmd, conn, params=[card_name] + valid_cmd_list)
+    cmd_counts = c.execute(q_cmd, [card_name] + valid_cmd_list).fetchall()
     
     q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d WHERE comandante IN {placeholders_cmd} {time_filtered_cond} GROUP BY comandante"
-    total_counts = pd.read_sql(q_tot_cmd, conn, params=valid_cmd_list)
+    total_counts = c.execute(q_tot_cmd, valid_cmd_list).fetchall()
+    tot_map = {r['comandante']: r['totale_comandante'] for r in total_counts}
     
-    res_cmd = pd.merge(cmd_counts, total_counts, on='comandante')
-    res_cmd['Percentuale'] = (res_cmd['mazzi_carta'] / res_cmd['totale_comandante'] * 100).round(1)
-    res_cmd = res_cmd.sort_values(by=['Percentuale', 'mazzi_carta'], ascending=False)
+    res_cmd = []
+    for r in cmd_counts:
+        cmd = r['comandante']
+        mazzi = r['mazzi_carta']
+        totale = tot_map.get(cmd, 1)
+        perc = round((mazzi / totale) * 100, 1)
+        res_cmd.append({
+            'comandante': cmd,
+            'mazzi_carta': mazzi,
+            'totale_comandante': totale,
+            'Percentuale': perc
+        })
+    res_cmd.sort(key=lambda x: (x['Percentuale'], x['mazzi_carta']), reverse=True)
     
-    all_cmd_names = res_cmd['comandante'].tolist()
+    all_cmd_names = [x['comandante'] for x in res_cmd]
     scryfall_cache = fetch_scryfall_data(all_cmd_names + [card_name])
 
     cmd_list = []
-    for _, row in res_cmd.iterrows():
+    for row in res_cmd:
         name = row['comandante']
         parts = [p.strip() for p in name.split(" / ")] if " / " in name else ([p.strip() for p in name.split(" // ")] if " // " in name else [name.strip()])
         images, art_crops, seen_images, seen_art_crops = [], [], set(), set()
@@ -896,24 +922,30 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
         GROUP BY c.card_name
     """
     syn_params = [card_name] + valid_cmd_list + [card_name]
-    syn_df = pd.read_sql(syn_query, conn, params=syn_params)
+    syn_rows = c.execute(syn_query, syn_params).fetchall()
     conn.close()
     
-    if not syn_df.empty:
-        syn_df['Percentuale'] = (syn_df['freq'] / total_decks_time * 100).round(1)
-        syn_df = syn_df.sort_values(by=['Percentuale', 'freq'], ascending=False).head(50)
-    else:
-        syn_df['Percentuale'] = 0.0
+    syn_df = []
+    for r in syn_rows:
+        freq = r['freq']
+        perc = round((freq / total_decks_time) * 100, 1)
+        syn_df.append({
+            'card_name': r['card_name'],
+            'freq': freq,
+            'Percentuale': perc
+        })
+    syn_df.sort(key=lambda x: (x['Percentuale'], x['freq']), reverse=True)
+    syn_df = syn_df[:50]
     
-    syn_cache = fetch_scryfall_data(syn_df['card_name'].tolist())
+    syn_cache = fetch_scryfall_data([x['card_name'] for x in syn_df])
     syn_formatted = []
-    for _, row in syn_df.iterrows():
-        c = row['card_name']
-        inf = syn_cache.get(c.lower(), {})
-        if not inf: inf = syn_cache.get(c.split("//")[0].strip().lower(), {"images": [], "art_crops": [], "type": "Altro", "oracles": [], "color_identity": []})
+    for row in syn_df:
+        cn = row['card_name']
+        inf = syn_cache.get(cn.lower(), {})
+        if not inf: inf = syn_cache.get(cn.split("//")[0].strip().lower(), {"images": [], "art_crops": [], "type": "Altro", "oracles": [], "color_identity": []})
             
         syn_formatted.append({
-            "card_name": c, "freq": int(row['freq']), "Percentuale": float(row['Percentuale']),
+            "card_name": cn, "freq": int(row['freq']), "Percentuale": float(row['Percentuale']),
             "images": inf.get("images", []), "art_crops": inf.get("art_crops", []), "oracles": inf.get("oracles", []),
             "color_identity": inf.get("color_identity", []), "category": categorizza_tipo(inf.get("type", ""))
         })
@@ -927,6 +959,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
 @lru_cache(maxsize=256)
 def get_commander_decks_cached(comandante: str, filtro_tempo: str, limit: int = 0, offset: int = 0):
     conn = get_db()
+    c = conn.cursor()
     conds = ["comandante = ?"]
     t_cond = get_time_condition(filtro_tempo)
     params = [comandante]
@@ -941,11 +974,11 @@ def get_commander_decks_cached(comandante: str, filtro_tempo: str, limit: int = 
     else:
         query = f"SELECT id_moxfield, data_aggiornamento FROM decks {where_clause} ORDER BY data_aggiornamento DESC"
         
-    df = pd.read_sql(query, conn, params=params)
+    df = c.execute(query, params).fetchall()
     conn.close()
     
     decks = []
-    for _, row in df.iterrows():
+    for row in df:
         decks.append({
             "id_moxfield": row['id_moxfield'],
             "url": f"https://moxfield.com/decks/{row['id_moxfield']}",
@@ -976,9 +1009,6 @@ async def get_dashboard(filtro_tempo: str = "Tutti i tempi"):
 
 @app.get("/api/health")
 async def get_health_status():
-    """Restituisce lo stato attuale e lo storico per creare i rettangolini."""
-    
-    # Leggiamo il vero e unico aggiornamento dal database mazzi principale
     try:
         mtime = os.path.getmtime(DB_PATH)
         db_last_updated = datetime.fromtimestamp(mtime).isoformat()
@@ -987,12 +1017,10 @@ async def get_health_status():
 
     history = {"moxfield": [], "scryfall": []}
     
-    # Leggiamo i log dal database separato della salute
     h_conn = get_health_db()
     h_c = h_conn.cursor()
     
     try:
-        # Prendi i log in ordine cronologico (dal più vecchio al più recente)
         h_c.execute("SELECT service, status, timestamp FROM health_logs ORDER BY timestamp ASC")
         for row in h_c.fetchall():
             service = row['service']
@@ -1013,28 +1041,20 @@ async def get_health_status():
 
 @app.delete("/api/admin/remove-deck/{deck_id}")
 async def remove_deck(deck_id: str, secret: str):
-    """Rimuove un mazzo da CentMeta e lo inserisce in blacklist per GDPR"""
-    # Recupera la password segreta dall'ambiente
     admin_password = os.getenv("ADMIN_SECRET")
     
-    # Blocca se la password non è configurata sul server o se è errata
     if not admin_password or secret != admin_password:
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
         
-    # Rimozione e blacklist avvengono SEMPRE nel DB principale
     conn = get_db()
     c = conn.cursor()
     try:
-        # 1. Rimuovi le carte del mazzo
         c.execute("DELETE FROM deck_cards WHERE deck_id = ?", (deck_id,))
-        # 2. Rimuovi il mazzo
         c.execute("DELETE FROM decks WHERE id_moxfield = ?", (deck_id,))
-        # 3. Aggiungi alla blacklist per ignorarlo nei futuri scraping
         now = datetime.now().isoformat()
         c.execute("INSERT OR IGNORE INTO blacklist (id_moxfield, data_rimozione) VALUES (?, ?)", (deck_id, now))
         conn.commit()
         
-        # Svuota la cache in memoria per aggiornare il sito istantaneamente
         clear_all_caches()
         
         return {"status": "success", "message": f"Mazzo {deck_id} rimosso e aggiunto alla blacklist."}

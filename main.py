@@ -4,8 +4,11 @@ import sqlite3
 import requests
 import asyncio
 import time as std_time
+import threading
+import logging
+import secrets
 from datetime import datetime, time, timedelta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from typing import Optional, List
@@ -15,6 +18,18 @@ import master_scraper
 
 scryfall_session = requests.Session()
 scryfall_session.headers.update({"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"})
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+def get_health_db():
+    conn = sqlite3.connect(HEALTH_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
 def sanitize_commanders_in_db():
     conn = get_db()
@@ -60,9 +75,14 @@ def setup_database_indices():
     finally:
         conn.close()
 
+_scryfall_lock = threading.RLock()
+_SCRYFALL_MISSING_CACHE = set()
+
 def clear_all_caches():
     global _SCRYFALL_CACHE_MEMORY
-    _SCRYFALL_CACHE_MEMORY = None
+    with _scryfall_lock:
+        _SCRYFALL_CACHE_MEMORY = None
+        _SCRYFALL_MISSING_CACHE.clear()
     get_valid_commanders_set.cache_clear()
     get_decks_stats_cached.cache_clear()
     get_card_details_cached.cache_clear()
@@ -94,57 +114,81 @@ def setup_health_db():
     h_conn.commit()
     h_conn.close()
 
-async def background_health_pinger():
+def _perform_health_pings():
     setup_health_db()
+    now = datetime.now().isoformat()
+    conn = get_health_db()
+    c = conn.cursor()
     
+    moxfield_ua = os.getenv("MOXFIELD_UA")
+    
+    # 1. Ping Scryfall
+    try:
+        res = requests.get(
+            "https://api.scryfall.com/cards/named?exact=Sol Ring",
+            headers={"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"},
+            timeout=10
+        )
+        if res.status_code == 200:
+            status = "operational"
+        elif res.status_code == 429:
+            status = "rate_limited"
+        else:
+            status = "error"
+    except Exception as req_err:
+        logging.warning(f"[HEALTH WARNING] Rilevata anomalia connessione scryfall: {req_err}")
+        status = "down"
+        
+    c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, "scryfall", status))
+    c.execute("""
+        DELETE FROM health_logs 
+        WHERE service=? AND rowid NOT IN (
+            SELECT rowid FROM health_logs 
+            WHERE service=? ORDER BY timestamp DESC LIMIT 48
+        )
+    """, ("scryfall", "scryfall"))
+    
+    # 2. Ping Moxfield
+    if not moxfield_ua:
+        logging.warning("[HEALTH WARNING] Variabile MOXFIELD_UA non impostata. Salto il ping a Moxfield.")
+    else:
+        try:
+            res = requests.get(
+                "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
+                headers={"User-Agent": moxfield_ua},
+                timeout=10
+            )
+            if res.status_code == 200:
+                status = "operational"
+            elif res.status_code == 429:
+                status = "rate_limited"
+            else:
+                status = "error"
+        except Exception as req_err:
+            logging.warning(f"[HEALTH WARNING] Rilevata anomalia connessione moxfield: {req_err}")
+            status = "down"
+            
+        c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, "moxfield", status))
+        c.execute("""
+            DELETE FROM health_logs 
+            WHERE service=? AND rowid NOT IN (
+                SELECT rowid FROM health_logs 
+                WHERE service=? ORDER BY timestamp DESC LIMIT 48
+            )
+        """, ("moxfield", "moxfield"))
+    
+    conn.commit()
+    conn.close()
+    print(f"[HEALTH] Ping orario completato alle {now}")
+
+async def background_health_pinger():
     while True:
         try:
-            now = datetime.now().isoformat()
-            conn = get_health_db()
-            c = conn.cursor()
-            moxfield_ua = os.getenv("MOXFIELD_UA", "CentMeta/1.0 (privacy@centmeta.it)")
-            
-            services_config = {
-                "moxfield": {
-                    "url": "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
-                    "headers": {"User-Agent": moxfield_ua}
-                },
-                "scryfall": {
-                    "url": "https://api.scryfall.com/catalog/card-names",
-                    "headers": {"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"}
-                }
-            }
-            
-            for service, config in services_config.items():
-                try:
-                    res = requests.get(config["url"], headers=config["headers"], timeout=10)
-                    if res.status_code == 200:
-                        status = "operational"
-                    elif res.status_code == 429:
-                        status = "rate_limited"
-                    else:
-                        status = "error"
-                except Exception as req_err:
-                    print(f"[HEALTH WARNING] Rilevata anomalia connessione {service}: {req_err}")
-                    status = "down"
-                    
-                c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, service, status))
-                
-                c.execute("""
-                    DELETE FROM health_logs 
-                    WHERE service=? AND rowid NOT IN (
-                        SELECT rowid FROM health_logs 
-                        WHERE service=? ORDER BY timestamp DESC LIMIT 48
-                    )
-                """, (service, service))
-            
-            conn.commit()
-            conn.close()
-            print(f"[HEALTH] Ping orario completato alle {now}")
-            
+            await run_in_threadpool(_perform_health_pings)
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            print(f"[HEALTH ERROR] Errore critico nel loop di ping: {e}")
-            
+            logging.error(f"[HEALTH ERROR] Errore critico nel loop di ping: {e}")
         await asyncio.sleep(3600)
 
 async def warmup_caches(periodi: Optional[List[str]] = None):
@@ -193,6 +237,13 @@ async def background_db_updater():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Abilita il WAL mode prima di qualsiasi altra operazione
+    conn = get_db()
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    finally:
+        conn.close()
+
     sanitize_commanders_in_db()
     setup_database_indices()
     
@@ -234,15 +285,14 @@ CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
 
 _SCRYFALL_CACHE_MEMORY = None
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def get_health_db():
-    conn = sqlite3.connect(HEALTH_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_db_mtime():
+    mtimes = []
+    for path in (DB_PATH, f"{DB_PATH}-wal"):
+        try:
+            mtimes.append(os.path.getmtime(path))
+        except OSError:
+            pass
+    return max(mtimes) if mtimes else None
 
 def get_time_conditions_both(filtro_tempo: str):
     if filtro_tempo == "Ultimi 7 giorni":
@@ -263,26 +313,43 @@ def get_time_condition(filtro_tempo: str):
 
 def load_scryfall_cache():
     global _SCRYFALL_CACHE_MEMORY
-    if _SCRYFALL_CACHE_MEMORY is not None:
-        return _SCRYFALL_CACHE_MEMORY
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                _SCRYFALL_CACHE_MEMORY = json.load(f)
-        else:
+    with _scryfall_lock:
+        if _SCRYFALL_CACHE_MEMORY is not None:
+            return _SCRYFALL_CACHE_MEMORY
+        try:
+            if os.path.exists(CACHE_FILE):
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    _SCRYFALL_CACHE_MEMORY = json.load(f)
+            else:
+                _SCRYFALL_CACHE_MEMORY = {}
+        except Exception as e:
+            ts = int(std_time.time())
+            corrupt_name = f"{CACHE_FILE}.corrupt-{ts}"
+            logging.warning(f"Cache Scryfall corrotta ({e}). Rinomino in {corrupt_name} e riparto pulito.")
+            try:
+                os.replace(CACHE_FILE, corrupt_name)
+            except Exception:
+                pass
             _SCRYFALL_CACHE_MEMORY = {}
-    except Exception:
-        _SCRYFALL_CACHE_MEMORY = {}
-    return _SCRYFALL_CACHE_MEMORY
+        return _SCRYFALL_CACHE_MEMORY
 
 def save_scryfall_cache(cache):
     global _SCRYFALL_CACHE_MEMORY
-    _SCRYFALL_CACHE_MEMORY = cache
+    with _scryfall_lock:
+        _SCRYFALL_CACHE_MEMORY = cache
+        snapshot = cache.copy()
+        
+    tmp_file = f"{CACHE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=4)
-    except Exception:
-        pass
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp_file, CACHE_FILE)
+    except Exception as e:
+        logging.warning(f"Errore durante il salvataggio della cache Scryfall: {e}")
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
 
 def fetch_scryfall_data(card_names):
     results = load_scryfall_cache()
@@ -299,13 +366,19 @@ def fetch_scryfall_data(card_names):
         else:
             actual_names.add(n)
 
-    for n in actual_names:
-        key = n.lower()
-        if key not in results or not results[key].get("images"):
-            mancanti.append(n)
+    with _scryfall_lock:
+        for n in actual_names:
+            key = n.lower()
+            if key in _SCRYFALL_MISSING_CACHE:
+                continue
+            if key not in results or not results[key].get("images"):
+                mancanti.append(n)
             
     if mancanti:
         for i in range(0, len(mancanti), 75):
+            if i > 0:
+                std_time.sleep(0.1)
+                
             chunk = mancanti[i:i+75]
             identifiers = [{"name": n} for n in chunk]
             updated_in_chunk = False
@@ -317,7 +390,9 @@ def fetch_scryfall_data(card_names):
                     timeout=15
                 )
                 if res.status_code == 200:
-                    for card in res.json().get("data", []):
+                    body = res.json()
+                    
+                    for card in body.get("data", []):
                         name = card.get("name", "")
                         
                         is_dfc_override = False
@@ -352,8 +427,8 @@ def fetch_scryfall_data(card_names):
                                         name = card.get("name", "")
                                         if " // " in name: faces_names = [f.strip() for f in name.split(" // ")]
                                         else: faces_names = []
-                            except:
-                                pass
+                            except Exception as e:
+                                logging.warning(f"Errore ricerca alternativa Scryfall per {query_name}: {e}")
 
                         type_line = card.get("type_line", "")
                         if not type_line and "card_faces" in card and len(card["card_faces"]) > 0:
@@ -396,12 +471,19 @@ def fetch_scryfall_data(card_names):
                             if f1 not in results or " // " in results[f1].get("full_name", " // "): results[f1] = card_data
                             
                         updated_in_chunk = True
-                        
-            except Exception:
-                pass
+
+                    with _scryfall_lock:
+                        for nf in body.get("not_found", []):
+                            nf_name = nf.get("name")
+                            if nf_name:
+                                _SCRYFALL_MISSING_CACHE.add(nf_name.lower())
+                                
+            except Exception as e:
+                logging.warning(f"Errore API Scryfall collection: {e}")
             
             if updated_in_chunk:
                 save_scryfall_cache(results)
+                    
     return results
 
 def categorizza_tipo(type_line):
@@ -676,7 +758,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
 @lru_cache(maxsize=128)
 def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: int = 0, offset: int = 0):
     try:
-        mtime = os.path.getmtime(DB_PATH)
+        mtime = get_db_mtime()
         global_last_updated = datetime.fromtimestamp(mtime).isoformat()
     except Exception:
         global_last_updated = None
@@ -769,8 +851,6 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
         })
         
     stats_list.sort(key=lambda x: (x['Percentuale'], x['freq']), reverse=True)
-    if limit > 0: 
-        stats_list = stats_list[offset : offset + limit]
     
     scryfall_cache = fetch_scryfall_data([x['card_name'] for x in stats_list])
     
@@ -820,6 +900,9 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
         terre_mancanti = 100.0 - somma_univoche
         if terre_mancanti > 0:
             type_dist["Terre"] += terre_mancanti
+            
+    if limit > 0:
+        formatted_cards = formatted_cards[offset : offset + limit]
         
     return {
         "total_decks": total_decks,
@@ -848,6 +931,14 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
 
     q_tot_glob = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ? AND d.comandante IN {placeholders_cmd}"
     total_decks_global = c.execute(q_tot_glob, [card_name] + valid_cmd_list).fetchone()['tot']
+    
+    if total_decks_global == 0:
+        conn.close()
+        return {
+            "card_name": card_name, "images": [], "art_crops": [],
+            "oracles": [], "total_decks_with_card": 0, "total_decks_global": 0,
+            "commanders": [], "synergies": []
+        }
     
     q_tot_time = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ? AND d.comandante IN {placeholders_cmd} {time_filtered_cond}"
     total_decks_time = c.execute(q_tot_time, [card_name] + valid_cmd_list).fetchone()['tot']
@@ -970,7 +1061,8 @@ def get_commander_decks_cached(comandante: str, filtro_tempo: str, limit: int = 
     where_clause = " WHERE " + " AND ".join(conds)
     
     if limit > 0:
-        query = f"SELECT id_moxfield, data_aggiornamento FROM decks {where_clause} ORDER BY data_aggiornamento DESC LIMIT {limit} OFFSET {offset}"
+        query = f"SELECT id_moxfield, data_aggiornamento FROM decks {where_clause} ORDER BY data_aggiornamento DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
     else:
         query = f"SELECT id_moxfield, data_aggiornamento FROM decks {where_clause} ORDER BY data_aggiornamento DESC"
         
@@ -986,31 +1078,45 @@ def get_commander_decks_cached(comandante: str, filtro_tempo: str, limit: int = 
         })
     return decks
 
+VALID_PERIODS = {"Ultimi 7 giorni", "Ultimi 30 giorni", "Ultimi 3 mesi", "Ultimi 6 mesi", "Ultimo anno", "Tutti i tempi"}
+
+def normalize_period(p: str) -> str:
+    return p if p in VALID_PERIODS else "Tutti i tempi"
+
 @app.get("/api/commanders")
 async def get_commanders(filtro_tempo: str = "Tutti i tempi"):
+    filtro_tempo = normalize_period(filtro_tempo)
     _, result_list = await run_in_threadpool(get_valid_commanders_set, filtro_tempo)
     return result_list
 
 @app.get("/api/decks/stats")
 async def get_decks_stats(filtro_tempo: str = "Tutti i tempi", comandante: Optional[str] = None, limit: int = 0, offset: int = 0):
+    filtro_tempo = normalize_period(filtro_tempo)
+    limit = max(0, min(limit, 500))
+    offset = max(0, offset)
     return await run_in_threadpool(get_decks_stats_cached, filtro_tempo, comandante, limit, offset)
 
 @app.get("/api/card/details")
 async def get_card_details(card_name: str, filtro_tempo: str = "Tutti i tempi"):
+    filtro_tempo = normalize_period(filtro_tempo)
     return await run_in_threadpool(get_card_details_cached, card_name, filtro_tempo)
 
 @app.get("/api/commander/decks")
 async def get_commander_decks(comandante: str, filtro_tempo: str = "Tutti i tempi", limit: int = 0, offset: int = 0):
+    filtro_tempo = normalize_period(filtro_tempo)
+    limit = max(0, min(limit, 500))
+    offset = max(0, offset)
     return await run_in_threadpool(get_commander_decks_cached, comandante, filtro_tempo, limit, offset)
 
 @app.get("/api/home/dashboard")
 async def get_dashboard(filtro_tempo: str = "Tutti i tempi"):
+    filtro_tempo = normalize_period(filtro_tempo)
     return await run_in_threadpool(get_dashboard_data_cached, filtro_tempo)
 
 @app.get("/api/health")
 async def get_health_status():
     try:
-        mtime = os.path.getmtime(DB_PATH)
+        mtime = get_db_mtime()
         db_last_updated = datetime.fromtimestamp(mtime).isoformat()
     except Exception:
         db_last_updated = None
@@ -1040,10 +1146,23 @@ async def get_health_status():
     }
 
 @app.delete("/api/admin/remove-deck/{deck_id}")
-async def remove_deck(deck_id: str, secret: str):
+async def remove_deck(
+    deck_id: str, 
+    secret: Optional[str] = Query(None), 
+    x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")
+):
     admin_password = os.getenv("ADMIN_SECRET")
     
-    if not admin_password or secret != admin_password:
+    provided_secret = x_admin_secret
+    if secret is not None:
+        logging.warning("Deprecation: è stato usato il query parameter 'secret' al posto dell'header 'X-Admin-Secret'.")
+        if provided_secret is None:
+            provided_secret = secret
+    
+    if not admin_password or not provided_secret:
+        raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
+        
+    if not secrets.compare_digest(provided_secret.encode('utf-8'), admin_password.encode('utf-8')):
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
         
     conn = get_db()

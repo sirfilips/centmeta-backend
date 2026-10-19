@@ -407,7 +407,21 @@ def run_scraper():
         if (i + 1) % 100 == 0:
             logging.info(f"Progresso download: {i + 1}/{len(to_download)}...")
 
-    # 8. SCRITTURA NEL DB (Singola Transazione con Riconciliazione)
+    # 8. BACKUP PREVENTIVO E SCRITTURA NEL DB (Singola Transazione con Riconciliazione)
+    if os.path.exists(db_path):
+        try:
+            backup_path = f"{db_path}.bak"
+            logging.info("Creazione snapshot di backup preventivo del database...")
+            b_src = sqlite3.connect(db_path, timeout=30)
+            b_dst = sqlite3.connect(backup_path, timeout=30)
+            with b_dst:
+                b_src.backup(b_dst)
+            b_dst.close()
+            b_src.close()
+            logging.info(f"Snapshot preventivo completato con successo: {os.path.basename(backup_path)}")
+        except Exception as b_err:
+            logging.warning(f"Impossibile completare lo snapshot di backup preventivo: {b_err}")
+
     logging.info("Avvio scrittura incrementale nel DB (Transazione sicura)...")
     conn = sqlite3.connect(db_path, timeout=30)
     try:

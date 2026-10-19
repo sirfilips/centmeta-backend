@@ -205,7 +205,7 @@ async def warmup_caches(periodi: Optional[List[str]] = None):
     print(f"[WARMUP] Avvio pre-warming per {len(periodi)} periodo/i: {', '.join(periodi)}...")
     for periodo in periodi:
         print(f"[WARMUP] Costruzione cache per: {periodo}...")
-        await run_in_threadpool(get_decks_stats_cached, periodo, None, 0, 0)
+        await run_in_threadpool(get_decks_stats_cached, periodo, None)
         await run_in_threadpool(get_dashboard_data_cached, periodo)
     print("[WARMUP] Pre-warming completato. Sistema pronto.")
 
@@ -264,7 +264,7 @@ async def lifespan(app: FastAPI):
     updater_task.cancel()
     health_task.cancel()
 
-app = FastAPI(title="CentMeta API", version="3.4", lifespan=lifespan)
+app = FastAPI(title="CentMeta API", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -296,15 +296,15 @@ def get_db_mtime():
 
 def get_time_conditions_both(filtro_tempo: str):
     if filtro_tempo == "Ultimi 7 giorni":
-        return "datetime(data_aggiornamento) >= datetime('now', '-7 days')", "datetime(data_aggiornamento) >= datetime('now', '-14 days') AND datetime(data_aggiornamento) < datetime('now', '-7 days')"
+        return "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days')", "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days') AND data_aggiornamento < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days')"
     elif filtro_tempo == "Ultimi 30 giorni":
-        return "datetime(data_aggiornamento) >= datetime('now', '-30 days')", "datetime(data_aggiornamento) >= datetime('now', '-60 days') AND datetime(data_aggiornamento) < datetime('now', '-30 days')"
+        return "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-30 days')", "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 days') AND data_aggiornamento < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-30 days')"
     elif filtro_tempo == "Ultimi 3 mesi":
-        return "datetime(data_aggiornamento) >= datetime('now', '-3 months')", "datetime(data_aggiornamento) >= datetime('now', '-6 months') AND datetime(data_aggiornamento) < datetime('now', '-3 months')"
+        return "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-3 months')", "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-6 months') AND data_aggiornamento < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-3 months')"
     elif filtro_tempo == "Ultimi 6 mesi":
-        return "datetime(data_aggiornamento) >= datetime('now', '-6 months')", "datetime(data_aggiornamento) >= datetime('now', '-12 months') AND datetime(data_aggiornamento) < datetime('now', '-6 months')"
+        return "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-6 months')", "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-12 months') AND data_aggiornamento < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-6 months')"
     elif filtro_tempo == "Ultimo anno":
-        return "datetime(data_aggiornamento) >= datetime('now', '-1 year')", "datetime(data_aggiornamento) >= datetime('now', '-2 years') AND datetime(data_aggiornamento) < datetime('now', '-1 year')"
+        return "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-1 year')", "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-2 years') AND data_aggiornamento < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-1 year')"
     return None, None
 
 def get_time_condition(filtro_tempo: str):
@@ -551,22 +551,31 @@ def get_valid_commanders_set(filtro_tempo: str):
         
         for part in parts:
             clean_key = part.lower()
-            info = scryfall_cache.get(clean_key, {})
+            info = scryfall_cache.get(clean_key)
             
-            t_line = info.get("type", "").lower()
-            if "legendary" not in t_line and "planeswalker" not in t_line:
+            # Se la carta non è in cache (es. Scryfall down/timeout/rate limited),
+            # non la scartiamo a priori per evitare che l'intero meta risulti vuoto.
+            # Scartiamo solo se abbiamo i dati da Scryfall e NON è leggendaria/planeswalker,
+            # oppure se il nome è esplicitamente 'sconosciuto'.
+            if clean_key == "sconosciuto":
                 is_valid = False
                 break
                 
-            for img in info.get("images", []):
-                if img not in seen_images: seen_images.add(img); images.append(img)
-            for ac in info.get("art_crops", []):
-                if ac not in seen_art_crops: seen_art_crops.add(ac); art_crops.append(ac)
-            for oracle in info.get("oracles", []):
-                if oracle not in oracles: oracles.append(oracle)
-                
-            for color in info.get("color_identity", []):
-                cmd_color_identity.add(color)
+            if info:
+                t_line = info.get("type", "").lower()
+                if t_line and "legendary" not in t_line and "planeswalker" not in t_line:
+                    is_valid = False
+                    break
+                    
+                for img in info.get("images", []):
+                    if img not in seen_images: seen_images.add(img); images.append(img)
+                for ac in info.get("art_crops", []):
+                    if ac not in seen_art_crops: seen_art_crops.add(ac); art_crops.append(ac)
+                for oracle in info.get("oracles", []):
+                    if oracle not in oracles: oracles.append(oracle)
+                    
+                for color in info.get("color_identity", []):
+                    cmd_color_identity.add(color)
         
         t_val = row['trend']
         if t_val is None:
@@ -613,8 +622,8 @@ def get_dashboard_data_cached(filtro_tempo: str):
     else:
         df_top_cmd = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_cmd_rows[:25]]
 
-    q_p1 = "SELECT comandante, COUNT(*) as cnt1 FROM decks WHERE datetime(data_aggiornamento) > datetime('now', '-7 days') GROUP BY comandante"
-    q_p2 = "SELECT comandante, COUNT(*) as cnt2 FROM decks WHERE datetime(data_aggiornamento) <= datetime('now', '-7 days') AND datetime(data_aggiornamento) > datetime('now', '-14 days') GROUP BY comandante"
+    q_p1 = "SELECT comandante, COUNT(*) as cnt1 FROM decks WHERE data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') GROUP BY comandante"
+    q_p2 = "SELECT comandante, COUNT(*) as cnt2 FROM decks WHERE data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days') GROUP BY comandante"
     p1_rows = c.execute(q_p1).fetchall()
     p2_rows = c.execute(q_p2).fetchall()
     p2_dict = {r['comandante']: r['cnt2'] for r in p2_rows}
@@ -663,12 +672,12 @@ def get_dashboard_data_cached(filtro_tempo: str):
     q_hc1 = """
         SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt1 
         FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-        WHERE datetime(d.data_aggiornamento) > datetime('now', '-7 days') GROUP BY c.card_name
+        WHERE d.data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') GROUP BY c.card_name
     """
     q_hc2 = """
         SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt2 
         FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-        WHERE datetime(d.data_aggiornamento) <= datetime('now', '-7 days') AND datetime(d.data_aggiornamento) > datetime('now', '-14 days') GROUP BY c.card_name
+        WHERE d.data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND d.data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days') GROUP BY c.card_name
     """
     hc1_rows = c.execute(q_hc1).fetchall()
     hc2_rows = c.execute(q_hc2).fetchall()
@@ -756,7 +765,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
     }
 
 @lru_cache(maxsize=128)
-def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: int = 0, offset: int = 0):
+def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
     try:
         mtime = get_db_mtime()
         global_last_updated = datetime.fromtimestamp(mtime).isoformat()
@@ -901,9 +910,6 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str], limit: 
         if terre_mancanti > 0:
             type_dist["Terre"] += terre_mancanti
             
-    if limit > 0:
-        formatted_cards = formatted_cards[offset : offset + limit]
-        
     return {
         "total_decks": total_decks,
         "last_updated": global_last_updated,
@@ -1094,7 +1100,19 @@ async def get_decks_stats(filtro_tempo: str = "Tutti i tempi", comandante: Optio
     filtro_tempo = normalize_period(filtro_tempo)
     limit = max(0, min(limit, 500))
     offset = max(0, offset)
-    return await run_in_threadpool(get_decks_stats_cached, filtro_tempo, comandante, limit, offset)
+    
+    data = await run_in_threadpool(get_decks_stats_cached, filtro_tempo, comandante)
+    
+    # Se è richiesta paginazione (limit > 0 o offset > 0), facciamo slice senza toccare il dict originale in cache
+    if limit > 0 or offset > 0:
+        cards = data.get("cards", [])
+        sliced_cards = cards[offset : offset + limit] if limit > 0 else cards[offset:]
+        return {
+            **data,
+            "cards": sliced_cards
+        }
+        
+    return data
 
 @app.get("/api/card/details")
 async def get_card_details(card_name: str, filtro_tempo: str = "Tutti i tempi"):
@@ -1145,24 +1163,17 @@ async def get_health_status():
         "history": history
     }
 
-@app.delete("/api/admin/remove-deck/{deck_id}")
+@app.delete("/api/admin/remove-deck/{deck_id}", include_in_schema=False)
 async def remove_deck(
     deck_id: str, 
-    secret: Optional[str] = Query(None), 
     x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")
 ):
     admin_password = os.getenv("ADMIN_SECRET")
     
-    provided_secret = x_admin_secret
-    if secret is not None:
-        logging.warning("Deprecation: è stato usato il query parameter 'secret' al posto dell'header 'X-Admin-Secret'.")
-        if provided_secret is None:
-            provided_secret = secret
-    
-    if not admin_password or not provided_secret:
+    if not admin_password or not x_admin_secret:
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
         
-    if not secrets.compare_digest(provided_secret.encode('utf-8'), admin_password.encode('utf-8')):
+    if not secrets.compare_digest(x_admin_secret.encode('utf-8'), admin_password.encode('utf-8')):
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
         
     conn = get_db()
@@ -1178,6 +1189,7 @@ async def remove_deck(
         
         return {"status": "success", "message": f"Mazzo {deck_id} rimosso e aggiunto alla blacklist."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"[ADMIN ERROR] Errore rimozione mazzo {deck_id}: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno durante l'operazione")
     finally:
         conn.close()

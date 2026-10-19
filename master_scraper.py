@@ -170,6 +170,7 @@ def run_scraper():
         logging.error("Variabile d'ambiente MOXFIELD_UA non impostata")
         return
         
+    ua = ua.strip()
     session.headers.update({"User-Agent": ua})
     
     is_dry_run = os.environ.get("SCRAPER_DRY_RUN") == "1"

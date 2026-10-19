@@ -121,6 +121,8 @@ def _perform_health_pings():
     c = conn.cursor()
     
     moxfield_ua = os.getenv("MOXFIELD_UA")
+    if moxfield_ua:
+        moxfield_ua = moxfield_ua.strip()
     
     # 1. Ping Scryfall
     try:
@@ -165,7 +167,10 @@ def _perform_health_pings():
             else:
                 status = "error"
         except Exception as req_err:
-            logging.warning(f"[HEALTH WARNING] Rilevata anomalia connessione moxfield: {req_err}")
+            err_msg = str(req_err)
+            if moxfield_ua and moxfield_ua in err_msg:
+                err_msg = err_msg.replace(moxfield_ua, "[REDACTED_UA]")
+            logging.warning(f"[HEALTH WARNING] Rilevata anomalia connessione moxfield: {err_msg}")
             status = "down"
             
         c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, "moxfield", status))

@@ -6,6 +6,12 @@ import logging
 import requests
 from datetime import datetime
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Costanti di sicurezza e configurazione
 SOGLIA_MINIMA_RISULTATI = 0.9
 MIN_MAZZI_PER_CONTROLLO = 20
@@ -66,16 +72,27 @@ def init_db(db_path):
             data_rimozione TEXT
         )
     ''')
-    # Creazione degli indici ottimizzati (allineati a main.py)
+    # Creazione degli indici covering ottimizzati (allineati a main.py)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_comandante ON decks(comandante)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_data ON decks(data_aggiornamento)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_deck_cards_deck_id ON deck_cards(deck_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_deck_cards_card_name ON deck_cards(card_name)")
-    
+
+    existing_idx = {
+        row[0]: (row[1] or "")
+        for row in cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='deck_cards'"
+        ).fetchall()
+    }
+    if "(deck_id, card_name)" not in existing_idx.get("idx_deck_cards_deck_id", ""):
+        cursor.execute("DROP INDEX IF EXISTS idx_deck_cards_deck_id")
+        cursor.execute("CREATE INDEX idx_deck_cards_deck_id ON deck_cards(deck_id, card_name)")
+    if "(card_name, deck_id)" not in existing_idx.get("idx_deck_cards_card_name", ""):
+        cursor.execute("DROP INDEX IF EXISTS idx_deck_cards_card_name")
+        cursor.execute("CREATE INDEX idx_deck_cards_card_name ON deck_cards(card_name, deck_id)")
+
     # Pulizia indici duplicati o desueti
     cursor.execute("DROP INDEX IF EXISTS idx_card_name")
     cursor.execute("DROP INDEX IF EXISTS idx_comandante")
-    
+
     conn.commit()
     conn.close()
 
@@ -214,6 +231,7 @@ def run_scraper():
                     for carta in set(mazzo.get("carte", [])):
                         cursor.execute("INSERT INTO deck_cards (deck_id, card_name) VALUES (?, ?)", (deck_id, carta))
                         
+                cursor.execute("ANALYZE")
                 conn.commit()
                 import_success = True
                 logging.info(f"Conversione completata! {len(database_pulito) - skipped_blacklist} mazzi importati ({skipped_blacklist} ignorati per blacklist).")
@@ -461,6 +479,7 @@ def run_scraper():
             if cards_to_insert:
                 cursor.executemany("INSERT INTO deck_cards (deck_id, card_name) VALUES (?, ?)", cards_to_insert)
                 
+        cursor.execute("ANALYZE")
         conn.commit()
         
         # (e) Tocco l'mtime del file solo ad aggiornamento effettivamente completato

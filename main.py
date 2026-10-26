@@ -16,8 +16,21 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 import master_scraper
 
-scryfall_session = requests.Session()
-scryfall_session.headers.update({"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"})
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+_thread_local = threading.local()
+
+def get_scryfall_session() -> requests.Session:
+    session = getattr(_thread_local, "scryfall_session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"})
+        _thread_local.scryfall_session = session
+    return session
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
@@ -66,10 +79,33 @@ def setup_database_indices():
     try:
         c.execute("CREATE INDEX IF NOT EXISTS idx_decks_comandante ON decks(comandante)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_decks_data ON decks(data_aggiornamento)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_deck_cards_deck_id ON deck_cards(deck_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_deck_cards_card_name ON deck_cards(card_name)")
-        conn.commit()
-        print("[DB] Indici ottimizzati con successo.")
+
+        existing_idx = {
+            row[0]: (row[1] or "")
+            for row in c.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='deck_cards'"
+            ).fetchall()
+        }
+        needs_analyze = False
+        if "(deck_id, card_name)" not in existing_idx.get("idx_deck_cards_deck_id", ""):
+            c.execute("DROP INDEX IF EXISTS idx_deck_cards_deck_id")
+            c.execute("CREATE INDEX idx_deck_cards_deck_id ON deck_cards(deck_id, card_name)")
+            needs_analyze = True
+        if "(card_name, deck_id)" not in existing_idx.get("idx_deck_cards_card_name", ""):
+            c.execute("DROP INDEX IF EXISTS idx_deck_cards_card_name")
+            c.execute("CREATE INDEX idx_deck_cards_card_name ON deck_cards(card_name, deck_id)")
+            needs_analyze = True
+
+        has_stat1 = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+        ).fetchone()
+        if needs_analyze or not has_stat1:
+            c.execute("ANALYZE")
+            conn.commit()
+            print("[DB] Indici covering e statistiche ANALYZE ottimizzati con successo.")
+        else:
+            conn.commit()
+            print("[DB] Indici ottimizzati con successo.")
     except Exception as e:
         print(f"[DB ERROR] Creazione indici fallita: {e}")
     finally:
@@ -83,6 +119,8 @@ def clear_all_caches():
     with _scryfall_lock:
         _SCRYFALL_CACHE_MEMORY = None
         _SCRYFALL_MISSING_CACHE.clear()
+    get_global_commanders_validity.cache_clear()
+    get_global_cards_stats.cache_clear()
     get_valid_commanders_set.cache_clear()
     get_decks_stats_cached.cache_clear()
     get_card_details_cached.cache_clear()
@@ -90,17 +128,18 @@ def clear_all_caches():
     get_dashboard_data_cached.cache_clear()
     print("[CACHE] Tutte le cache in memoria sono state svuotate.")
 
-def setup_health_db():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS blacklist (
-            id_moxfield TEXT PRIMARY KEY,
-            data_rimozione TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+def setup_health_db(init_main_blacklist: bool = True):
+    if init_main_blacklist:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS blacklist (
+                id_moxfield TEXT PRIMARY KEY,
+                data_rimozione TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
 
     h_conn = get_health_db()
     h_c = h_conn.cursor()
@@ -115,7 +154,7 @@ def setup_health_db():
     h_conn.close()
 
 def _perform_health_pings():
-    setup_health_db()
+    setup_health_db(init_main_blacklist=False)
     now = datetime.now().isoformat()
     conn = get_health_db()
     c = conn.cursor()
@@ -126,9 +165,8 @@ def _perform_health_pings():
     
     # 1. Ping Scryfall
     try:
-        res = requests.get(
+        res = get_scryfall_session().get(
             "https://api.scryfall.com/cards/named?exact=Sol Ring",
-            headers={"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"},
             timeout=10
         )
         if res.status_code == 200:
@@ -208,6 +246,8 @@ async def warmup_caches(periodi: Optional[List[str]] = None):
             "Tutti i tempi"
         ]
     print(f"[WARMUP] Avvio pre-warming per {len(periodi)} periodo/i: {', '.join(periodi)}...")
+    await run_in_threadpool(get_global_commanders_validity)
+    await run_in_threadpool(get_global_cards_stats)
     for periodo in periodi:
         print(f"[WARMUP] Costruzione cache per: {periodo}...")
         await run_in_threadpool(get_decks_stats_cached, periodo, None)
@@ -240,8 +280,27 @@ async def background_db_updater():
             print(f"[CRON ERROR] Errore aggiornamento: {e}")
             await asyncio.sleep(3600)
 
+CARTELLA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
+HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db")
+CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
+
+_SCRYFALL_CACHE_MEMORY = None
+
+def get_db_mtime():
+    mtimes = []
+    for path in (DB_PATH, f"{DB_PATH}-wal"):
+        try:
+            if os.path.exists(path) and (path == DB_PATH or os.path.getsize(path) > 0):
+                mtimes.append(os.path.getmtime(path))
+        except OSError:
+            pass
+    return max(mtimes) if mtimes else None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    orig_mtime = get_db_mtime()
+
     # Abilita il WAL mode prima di qualsiasi altra operazione
     conn = get_db()
     try:
@@ -249,8 +308,20 @@ async def lifespan(app: FastAPI):
     finally:
         conn.close()
 
+    setup_health_db(init_main_blacklist=True)
     sanitize_commanders_in_db()
     setup_database_indices()
+
+    if orig_mtime is not None:
+        try:
+            conn = get_db()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            finally:
+                conn.close()
+            os.utime(DB_PATH, (orig_mtime, orig_mtime))
+        except Exception:
+            pass
     
     updater_task = asyncio.create_task(background_db_updater())
     health_task = asyncio.create_task(background_health_pinger())
@@ -269,7 +340,7 @@ async def lifespan(app: FastAPI):
     updater_task.cancel()
     health_task.cancel()
 
-app = FastAPI(title="CentMeta API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="CentMeta API", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -282,22 +353,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-CARTELLA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
-HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db")
-CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
-
-_SCRYFALL_CACHE_MEMORY = None
-
-def get_db_mtime():
-    mtimes = []
-    for path in (DB_PATH, f"{DB_PATH}-wal"):
-        try:
-            mtimes.append(os.path.getmtime(path))
-        except OSError:
-            pass
-    return max(mtimes) if mtimes else None
 
 def get_time_conditions_both(filtro_tempo: str):
     if filtro_tempo == "Ultimi 7 giorni":
@@ -356,40 +411,104 @@ def save_scryfall_cache(cache):
         except OSError:
             pass
 
+def _parse_scryfall_card_object(card: dict) -> dict:
+    name = card.get("name", "")
+    type_line = card.get("type_line", "")
+    if not type_line and "card_faces" in card and len(card["card_faces"]) > 0:
+        type_line = card["card_faces"][0].get("type_line", "Altro")
+
+    images = []
+    art_crops = []
+    oracles = []
+
+    if "card_faces" in card and len(card["card_faces"]) > 1 and "image_uris" in card["card_faces"][0]:
+        for face in card["card_faces"]:
+            if "image_uris" in face:
+                images.append(face["image_uris"].get("normal"))
+                art_crops.append(face["image_uris"].get("art_crop"))
+    else:
+        if "image_uris" in card:
+            images.append(card["image_uris"].get("normal"))
+            art_crops.append(card["image_uris"].get("art_crop"))
+
+    if "card_faces" in card:
+        for face in card["card_faces"]:
+            if "oracle_text" in face:
+                face_name = face.get("name", "")
+                face_text = face.get("oracle_text", "")
+                oracles.append(f"✦ {face_name} ✦\n{face_text}")
+    elif card.get("oracle_text"):
+        oracles.append(card.get("oracle_text"))
+
+    return {
+        "full_name": name,
+        "images": images,
+        "art_crops": art_crops,
+        "oracles": oracles,
+        "type": type_line,
+        "color_identity": card.get("color_identity", []),
+        "cmc": card.get("cmc", 0.0)
+    }
+
+def _is_valid_cached_card(entry: Optional[dict]) -> bool:
+    if not entry or not entry.get("images"):
+        return False
+    if entry.get("type") in ("Card", " Card // Card"):
+        return False
+    return True
+
 def fetch_scryfall_data(card_names):
     results = load_scryfall_cache()
     mancanti = []
     actual_names = set()
     
     for n in card_names:
-        if " // " in n:
-            actual_names.add(n)
-            actual_names.add(n.split(" // ")[0].strip())
-        elif " / " in n:
+        if not n:
+            continue
+        if " / " in n and " // " not in n:
             for part in n.split(" / "):
                 actual_names.add(part.strip())
         else:
-            actual_names.add(n)
+            actual_names.add(n.strip())
 
+    cache_updated_locally = False
     with _scryfall_lock:
+        # Rimuove eventuali voci corrotte "Card" (Jumpstart theme cards)
+        for bad_key in [k for k, v in results.items() if v.get("type") in ("Card", " Card // Card")]:
+            del results[bad_key]
+            cache_updated_locally = True
+
         for n in actual_names:
             key = n.lower()
             if key in _SCRYFALL_MISSING_CACHE:
                 continue
-            if key not in results or not results[key].get("images"):
-                mancanti.append(n)
+            if _is_valid_cached_card(results.get(key)):
+                continue
+            # Supporto carte ribilanciate Arena (es. "A-Unholy Heat" -> "Unholy Heat")
+            if key.startswith("a-") and _is_valid_cached_card(results.get(key[2:])):
+                results[key] = results[key[2:]]
+                cache_updated_locally = True
+                continue
+            mancanti.append(n)
+
+    if cache_updated_locally and not mancanti:
+        save_scryfall_cache(results)
             
     if mancanti:
+        session = get_scryfall_session()
+        weird_sets = {"sta", "otp", "wot", "mul", "brr", "sld", "mps", "mp2", "exp", "mb1", "plist", "h1r", "slx"}
+
         for i in range(0, len(mancanti), 75):
             if i > 0:
                 std_time.sleep(0.1)
                 
             chunk = mancanti[i:i+75]
             identifiers = [{"name": n} for n in chunk]
-            updated_in_chunk = False
+            updated_in_chunk = cache_updated_locally
+            cache_updated_locally = False
             
             try:
-                res = scryfall_session.post(
+                res = session.post(
                     "https://api.scryfall.com/cards/collection", 
                     json={"identifiers": identifiers}, 
                     timeout=15
@@ -399,89 +518,107 @@ def fetch_scryfall_data(card_names):
                     
                     for card in body.get("data", []):
                         name = card.get("name", "")
+                        faces_names = [f.strip() for f in name.split(" // ")] if " // " in name else []
+
+                        # Rileva carte reversibili (es. Secret Lair con stesso nome su ambo i lati)
+                        is_reversible_override = (
+                            card.get("layout") == "reversible_card"
+                            or (len(faces_names) > 1 and faces_names[0].lower() == faces_names[1].lower())
+                        )
+                        is_showcase_or_weird = (
+                            card.get("set") in weird_sets
+                            or card.get("frame") == "showcase"
+                            or card.get("type_line") in ("Card", "Card // Card")
+                        )
                         
-                        is_dfc_override = False
-                        faces_names = []
-                        if " // " in name:
-                            faces_names = [f.strip() for f in name.split(" // ")]
-                            requested_names_lower = [n.lower() for n in actual_names]
-                            if name.lower() not in requested_names_lower:
-                                is_dfc_override = True
-                                
-                        weird_sets = ["sta", "otp", "wot", "mul", "brr", "sld", "mps", "mp2", "exp", "mb1", "plist", "h1r", "slx"]
-                        is_showcase_or_weird = card.get("set") in weird_sets or card.get("frame") == "showcase"
-                        
-                        if is_dfc_override or is_showcase_or_weird:
+                        if is_reversible_override or is_showcase_or_weird:
                             std_time.sleep(0.05) 
-                            query_name = name
-                            if is_dfc_override:
-                                for f in faces_names:
-                                    if f.lower() in [n.lower() for n in actual_names]:
-                                        query_name = f
-                                        break
-                                q_str = f'!"{query_name}" -is:dfc -is:split -is:adventure -is:extra -is:promo -frame:showcase'
+                            query_name = faces_names[0] if is_reversible_override and faces_names else name
+                            if is_reversible_override:
+                                q_str = f'!"{query_name}" -is:dfc -is:split -is:adventure -is:extra -is:promo -frame:showcase -layout:art_series -layout:token -type:card'
                             else:
-                                q_str = f'!"{query_name}" -is:extra -is:promo -frame:showcase'
+                                q_str = f'!"{query_name}" -is:extra -is:promo -frame:showcase -layout:art_series -layout:token -type:card'
                             
                             try:
-                                search_res = scryfall_session.get('https://api.scryfall.com/cards/search', params={"q": q_str}, timeout=5)
+                                search_res = session.get('https://api.scryfall.com/cards/search', params={"q": q_str}, timeout=5)
                                 if search_res.status_code == 200:
                                     normal_data = search_res.json().get("data", [])
                                     if normal_data:
                                         card = normal_data[0] 
                                         name = card.get("name", "")
-                                        if " // " in name: faces_names = [f.strip() for f in name.split(" // ")]
-                                        else: faces_names = []
+                                        faces_names = [f.strip() for f in name.split(" // ")] if " // " in name else []
                             except Exception as e:
                                 logging.warning(f"Errore ricerca alternativa Scryfall per {query_name}: {e}")
 
-                        type_line = card.get("type_line", "")
-                        if not type_line and "card_faces" in card and len(card["card_faces"]) > 0:
-                            type_line = card["card_faces"][0].get("type_line", "Altro")
-                        
-                        images = []
-                        art_crops = []
-                        oracles = []
-                        
-                        if "card_faces" in card and len(card["card_faces"]) > 1 and "image_uris" in card["card_faces"][0]:
-                            for face in card["card_faces"]:
-                                if "image_uris" in face:
-                                    images.append(face["image_uris"].get("normal"))
-                                    art_crops.append(face["image_uris"].get("art_crop"))
-                        else:
-                            if "image_uris" in card:
-                                images.append(card["image_uris"].get("normal"))
-                                art_crops.append(card["image_uris"].get("art_crop"))
-                                
-                        if "card_faces" in card:
-                            for face in card["card_faces"]:
-                                if "oracle_text" in face:
-                                    face_name = face.get("name", "")
-                                    face_text = face.get("oracle_text", "")
-                                    oracles.append(f"✦ {face_name} ✦\n{face_text}")
-                        elif card.get("oracle_text"):
-                            oracles.append(card.get("oracle_text"))
+                        card_data = _parse_scryfall_card_object(card)
+                        if not _is_valid_cached_card(card_data):
+                            with _scryfall_lock:
+                                _SCRYFALL_MISSING_CACHE.add(name.lower())
+                            continue
 
-                        color_identity = card.get("color_identity", [])
-                        
-                        card_data = {
-                            "full_name": name, "images": images, "art_crops": art_crops, "oracles": oracles, "type": type_line, "color_identity": color_identity, "cmc": card.get("cmc", 0.0)
-                        }
-                        
-                        results[name.lower()] = card_data
-                        if " // " in name and len(faces_names) > 1:
-                            f0 = faces_names[0].strip().lower()
-                            f1 = faces_names[1].strip().lower()
-                            if f0 not in results or " // " in results[f0].get("full_name", " // "): results[f0] = card_data
-                            if f1 not in results or " // " in results[f1].get("full_name", " // "): results[f1] = card_data
-                            
+                        with _scryfall_lock:
+                            results[name.lower()] = card_data
+                            if " // " in name and len(faces_names) > 1:
+                                f0 = faces_names[0].strip().lower()
+                                f1 = faces_names[1].strip().lower()
+                                if not _is_valid_cached_card(results.get(f0)) or " // " in results[f0].get("full_name", " // "):
+                                    results[f0] = card_data
+                                if not _is_valid_cached_card(results.get(f1)) or " // " in results[f1].get("full_name", " // "):
+                                    results[f1] = card_data
+
+                            # Allinea eventuali alias richiesti nel chunk (es. "Waste Land" -> "Wasteland")
+                            norm_target = name.lower().replace(" ", "").replace("-", "")
+                            for req_n in chunk:
+                                req_k = req_n.lower()
+                                if req_k not in results and req_k.replace(" ", "").replace("-", "") == norm_target:
+                                    results[req_k] = card_data
+
                         updated_in_chunk = True
 
-                    with _scryfall_lock:
-                        for nf in body.get("not_found", []):
-                            nf_name = nf.get("name")
-                            if nf_name:
-                                _SCRYFALL_MISSING_CACHE.add(nf_name.lower())
+                    for nf in body.get("not_found", []):
+                        nf_name = nf.get("name")
+                        if not nf_name:
+                            continue
+                        nf_key = nf_name.lower()
+
+                        # Fallback per carte Arena "A-..."
+                        if nf_key.startswith("a-") and _is_valid_cached_card(results.get(nf_key[2:])):
+                            with _scryfall_lock:
+                                results[nf_key] = results[nf_key[2:]]
+                            updated_in_chunk = True
+                            continue
+
+                        # Fallback con /cards/named per carte Split/DFC non risolte da /cards/collection (es. "Armed // Dangerous")
+                        resolved_via_named = False
+                        if " // " in nf_name:
+                            try:
+                                std_time.sleep(0.05)
+                                named_res = session.get(
+                                    "https://api.scryfall.com/cards/named",
+                                    params={"exact": nf_name},
+                                    timeout=10
+                                )
+                                if named_res.status_code == 200:
+                                    named_card = named_res.json()
+                                    card_data = _parse_scryfall_card_object(named_card)
+                                    if _is_valid_cached_card(card_data):
+                                        c_name = named_card.get("name", nf_name)
+                                        faces = [f.strip() for f in c_name.split(" // ")] if " // " in c_name else []
+                                        with _scryfall_lock:
+                                            results[nf_key] = card_data
+                                            results[c_name.lower()] = card_data
+                                            for f_part in faces:
+                                                fk = f_part.lower()
+                                                if not _is_valid_cached_card(results.get(fk)) or " // " in results[fk].get("full_name", " // "):
+                                                    results[fk] = card_data
+                                        updated_in_chunk = True
+                                        resolved_via_named = True
+                            except Exception as e:
+                                logging.warning(f"Errore fallback Scryfall named per {nf_name}: {e}")
+
+                        if not resolved_via_named:
+                            with _scryfall_lock:
+                                _SCRYFALL_MISSING_CACHE.add(nf_key)
                                 
             except Exception as e:
                 logging.warning(f"Errore API Scryfall collection: {e}")
@@ -490,6 +627,80 @@ def fetch_scryfall_data(card_names):
                 save_scryfall_cache(results)
                     
     return results
+
+def lookup_card_info(scryfall_cache: dict, card_name: str) -> dict:
+    if not card_name:
+        return {}
+    key = card_name.strip().lower()
+    info = scryfall_cache.get(key)
+    if _is_valid_cached_card(info):
+        return info
+    if " // " in key:
+        front = key.split(" // ")[0].strip()
+        info = scryfall_cache.get(front)
+        if _is_valid_cached_card(info):
+            return info
+    if key.startswith("a-"):
+        info = scryfall_cache.get(key[2:])
+        if _is_valid_cached_card(info):
+            return info
+    return info or {}
+
+def extract_commander_metadata(name: str, scryfall_cache: dict):
+    """
+    Estrae e valida i metadati di un comandante (Singolo, Bifronte DFC o Partner).
+    Restituisce (is_valid, images, art_crops, oracles, color_identity_list).
+    """
+    if not name or not name.strip():
+        return False, [], [], [], []
+
+    if " / " in name and " // " not in name:
+        parts = [p.strip() for p in name.split(" / ") if p.strip()]
+    else:
+        parts = [name.strip()]
+
+    is_valid = True
+    images = []
+    art_crops = []
+    oracles = []
+    seen_images = set()
+    seen_art_crops = set()
+    cmd_color_identity = set()
+
+    for part in parts:
+        clean_key = part.lower()
+        if clean_key == "sconosciuto":
+            is_valid = False
+            break
+
+        info = lookup_card_info(scryfall_cache, part)
+        if not info and " // " in part:
+            for face_part in part.split(" // "):
+                info = lookup_card_info(scryfall_cache, face_part.strip())
+                if info:
+                    break
+
+        if info:
+            t_line = info.get("type", "").lower()
+            if t_line and "legendary" not in t_line and "planeswalker" not in t_line:
+                is_valid = False
+                break
+
+            for img in info.get("images", []):
+                if img and img not in seen_images:
+                    seen_images.add(img)
+                    images.append(img)
+            for ac in info.get("art_crops", []):
+                if ac and ac not in seen_art_crops:
+                    seen_art_crops.add(ac)
+                    art_crops.append(ac)
+            for oracle in info.get("oracles", []):
+                if oracle and oracle not in oracles:
+                    oracles.append(oracle)
+            for color in info.get("color_identity", []):
+                cmd_color_identity.add(color)
+
+    return (is_valid and bool(parts)), images, art_crops, oracles, list(cmd_color_identity)
 
 def categorizza_tipo(type_line):
     t = type_line.lower()
@@ -502,19 +713,94 @@ def categorizza_tipo(type_line):
     if "land" in t: return "Terre"
     return "Altro"
 
+@lru_cache(maxsize=1)
+def get_global_commanders_validity():
+    """
+    Calcola l'insieme globale di tutti i comandanti validi e la tupla (compatta)
+    dei comandanti non validi presenti nel DB (es. 'Sconosciuto' o carte non leggendarie).
+    """
+    conn = get_db()
+    c = conn.cursor()
+    rows = c.execute("SELECT DISTINCT comandante FROM decks").fetchall()
+    conn.close()
+
+    all_cmds = [r["comandante"] for r in rows if r["comandante"]]
+    scryfall_cache = fetch_scryfall_data(all_cmds)
+
+    valid_all = set()
+    invalid_all = []
+    for cmd in all_cmds:
+        is_valid, _, _, _, _ = extract_commander_metadata(cmd, scryfall_cache)
+        if is_valid:
+            valid_all.add(cmd)
+        else:
+            invalid_all.append(cmd)
+
+    return frozenset(valid_all), tuple(sorted(invalid_all))
+
+@lru_cache(maxsize=1)
+def get_global_cards_stats():
+    """
+    Calcola e mette in cache il totale globale dei mazzi validi e la frequenza
+    globale di ogni carta su tutto il database, evitando di ricalcolarli ad ogni richiesta.
+    """
+    _, invalid_cmds = get_global_commanders_validity()
+    conn = get_db()
+    c = conn.cursor()
+
+    if invalid_cmds:
+        placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+        global_total = c.execute(
+            f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks WHERE comandante NOT IN {placeholders}",
+            invalid_cmds
+        ).fetchone()["tot"]
+        gc_rows = c.execute(
+            f"""
+            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as g_freq
+            FROM deck_cards c
+            JOIN decks d ON c.deck_id = d.id_moxfield
+            WHERE d.comandante NOT IN {placeholders}
+            GROUP BY c.card_name
+            """,
+            invalid_cmds
+        ).fetchall()
+    else:
+        global_total = c.execute("SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks").fetchone()["tot"]
+        gc_rows = c.execute("SELECT card_name, COUNT(DISTINCT deck_id) as g_freq FROM deck_cards GROUP BY card_name").fetchall()
+
+    conn.close()
+    global_cards = {r["card_name"]: r["g_freq"] for r in gc_rows}
+    return global_total, global_cards
+
 @lru_cache(maxsize=32)
 def get_valid_commanders_set(filtro_tempo: str):
+    _, invalid_cmds = get_global_commanders_validity()
     conn = get_db()
     c = conn.cursor()
     curr_cond, prev_cond = get_time_conditions_both(filtro_tempo)
-    base_where = f"WHERE {curr_cond}" if curr_cond else ""
-    
+
+    curr_conds = []
+    curr_params = []
+    if curr_cond:
+        curr_conds.append(curr_cond)
+    if invalid_cmds:
+        placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+        curr_conds.append(f"comandante NOT IN {placeholders}")
+        curr_params.extend(invalid_cmds)
+
+    base_where = f"WHERE {' AND '.join(curr_conds)}" if curr_conds else ""
     q_curr = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC"
-    curr_rows = c.execute(q_curr).fetchall()
+    curr_rows = c.execute(q_curr, curr_params).fetchall()
     
     if prev_cond:
-        q_prev = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {prev_cond} GROUP BY comandante ORDER BY cnt DESC"
-        prev_rows = c.execute(q_prev).fetchall()
+        prev_conds = [prev_cond]
+        prev_params = []
+        if invalid_cmds:
+            placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+            prev_conds.append(f"comandante NOT IN {placeholders}")
+            prev_params.extend(invalid_cmds)
+        q_prev = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {' AND '.join(prev_conds)} GROUP BY comandante ORDER BY cnt DESC"
+        prev_rows = c.execute(q_prev, prev_params).fetchall()
         prev_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_rows)}
         
         df_curr = []
@@ -541,46 +827,7 @@ def get_valid_commanders_set(filtro_tempo: str):
     
     for row in df_curr:
         name = row['comandante']
-        parts = []
-        if " / " in name: parts = [p.strip() for p in name.split(" / ")]
-        elif " // " in name: parts = [p.strip() for p in name.split(" // ")]
-        else: parts = [name.strip()]
-            
-        is_valid = True
-        images = []
-        art_crops = []
-        oracles = []
-        seen_images = set()
-        seen_art_crops = set()
-        cmd_color_identity = set()
-        
-        for part in parts:
-            clean_key = part.lower()
-            info = scryfall_cache.get(clean_key)
-            
-            # Se la carta non è in cache (es. Scryfall down/timeout/rate limited),
-            # non la scartiamo a priori per evitare che l'intero meta risulti vuoto.
-            # Scartiamo solo se abbiamo i dati da Scryfall e NON è leggendaria/planeswalker,
-            # oppure se il nome è esplicitamente 'sconosciuto'.
-            if clean_key == "sconosciuto":
-                is_valid = False
-                break
-                
-            if info:
-                t_line = info.get("type", "").lower()
-                if t_line and "legendary" not in t_line and "planeswalker" not in t_line:
-                    is_valid = False
-                    break
-                    
-                for img in info.get("images", []):
-                    if img not in seen_images: seen_images.add(img); images.append(img)
-                for ac in info.get("art_crops", []):
-                    if ac not in seen_art_crops: seen_art_crops.add(ac); art_crops.append(ac)
-                for oracle in info.get("oracles", []):
-                    if oracle not in oracles: oracles.append(oracle)
-                    
-                for color in info.get("color_identity", []):
-                    cmd_color_identity.add(color)
+        is_valid, images, art_crops, oracles, cmd_color_identity = extract_commander_metadata(name, scryfall_cache)
         
         t_val = row['trend']
         if t_val is None:
@@ -588,7 +835,7 @@ def get_valid_commanders_set(filtro_tempo: str):
         else:
             trend_out = int(t_val) if t_val != "" else ""
                     
-        if is_valid and parts:
+        if is_valid:
             valid_set.add(name)
             result_list.append({
                 "comandante": name,
@@ -597,26 +844,44 @@ def get_valid_commanders_set(filtro_tempo: str):
                 "images": images,
                 "art_crops": art_crops,
                 "oracles": oracles,
-                "color_identity": list(cmd_color_identity)
+                "color_identity": cmd_color_identity
             })
             
     return frozenset(valid_set), result_list
 
 @lru_cache(maxsize=32)
 def get_dashboard_data_cached(filtro_tempo: str):
+    _, invalid_cmds = get_global_commanders_validity()
     conn = get_db()
     c = conn.cursor()
     curr_cond, prev_cond = get_time_conditions_both(filtro_tempo)
-    base_where = f"WHERE {curr_cond}" if curr_cond else ""
-    
-    tot_decks = c.execute(f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {base_where}").fetchone()['tot']
+
+    inv_clause = ""
+    inv_clause_d = ""
+    inv_params = list(invalid_cmds)
+    if invalid_cmds:
+        placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+        inv_clause = f"comandante NOT IN {placeholders}"
+        inv_clause_d = f"d.comandante NOT IN {placeholders}"
+
+    def build_where(time_c: Optional[str], use_alias: bool = False):
+        conds = []
+        if time_c:
+            conds.append(time_c.replace("data_aggiornamento", "d.data_aggiornamento") if use_alias else time_c)
+        if invalid_cmds:
+            conds.append(inv_clause_d if use_alias else inv_clause)
+        return ("WHERE " + " AND ".join(conds)) if conds else ""
+
+    base_where = build_where(curr_cond, False)
+    tot_decks = c.execute(f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {base_where}", inv_params).fetchone()['tot']
 
     q_curr_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC"
-    curr_cmd_rows = c.execute(q_curr_cmd).fetchall()
+    curr_cmd_rows = c.execute(q_curr_cmd, inv_params).fetchall()
     
     if prev_cond:
-        q_prev_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {prev_cond} GROUP BY comandante ORDER BY cnt DESC"
-        prev_cmd_rows = c.execute(q_prev_cmd).fetchall()
+        prev_where = build_where(prev_cond, False)
+        q_prev_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {prev_where} GROUP BY comandante ORDER BY cnt DESC"
+        prev_cmd_rows = c.execute(q_prev_cmd, inv_params).fetchall()
         prev_cmd_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_cmd_rows)}
         
         df_top_cmd = []
@@ -627,10 +892,10 @@ def get_dashboard_data_cached(filtro_tempo: str):
     else:
         df_top_cmd = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_cmd_rows[:25]]
 
-    q_p1 = "SELECT comandante, COUNT(*) as cnt1 FROM decks WHERE data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') GROUP BY comandante"
-    q_p2 = "SELECT comandante, COUNT(*) as cnt2 FROM decks WHERE data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days') GROUP BY comandante"
-    p1_rows = c.execute(q_p1).fetchall()
-    p2_rows = c.execute(q_p2).fetchall()
+    p1_where = build_where("data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days')", False)
+    p2_where = build_where("data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days')", False)
+    p1_rows = c.execute(f"SELECT comandante, COUNT(*) as cnt1 FROM decks {p1_where} GROUP BY comandante", inv_params).fetchall()
+    p2_rows = c.execute(f"SELECT comandante, COUNT(*) as cnt2 FROM decks {p2_where} GROUP BY comandante", inv_params).fetchall()
     p2_dict = {r['comandante']: r['cnt2'] for r in p2_rows}
     
     df_hot_cmd = []
@@ -645,8 +910,8 @@ def get_dashboard_data_cached(filtro_tempo: str):
     df_hot_cmd.sort(key=lambda x: x['delta'], reverse=True)
     df_hot_cmd = df_hot_cmd[:50]
 
-    where_curr = base_where.replace('data_aggiornamento', 'd.data_aggiornamento') if base_where else ""
-    where_prev = f"WHERE {prev_cond.replace('data_aggiornamento', 'd.data_aggiornamento')}" if prev_cond else ""
+    where_curr = build_where(curr_cond, True)
+    where_prev = build_where(prev_cond, True)
     
     q_curr_cards = f"""
         SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
@@ -654,7 +919,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
         {where_curr}
         GROUP BY c.card_name ORDER BY freq DESC
     """
-    curr_card_rows = c.execute(q_curr_cards).fetchall()
+    curr_card_rows = c.execute(q_curr_cards, inv_params).fetchall()
     
     if prev_cond:
         q_prev_cards = f"""
@@ -663,7 +928,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
             {where_prev}
             GROUP BY c.card_name ORDER BY freq DESC
         """
-        prev_card_rows = c.execute(q_prev_cards).fetchall()
+        prev_card_rows = c.execute(q_prev_cards, inv_params).fetchall()
         prev_card_ranks = {r['card_name']: idx + 1 for idx, r in enumerate(prev_card_rows)}
         
         df_top_cards = []
@@ -674,18 +939,20 @@ def get_dashboard_data_cached(filtro_tempo: str):
     else:
         df_top_cards = [{'card_name': r['card_name'], 'freq': r['freq'], 'trend': ""} for r in curr_card_rows[:250]]
 
-    q_hc1 = """
+    hc1_where = build_where("data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days')", True)
+    hc2_where = build_where("data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days')", True)
+    q_hc1 = f"""
         SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt1 
         FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-        WHERE d.data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') GROUP BY c.card_name
+        {hc1_where} GROUP BY c.card_name
     """
-    q_hc2 = """
+    q_hc2 = f"""
         SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt2 
         FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-        WHERE d.data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND d.data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days') GROUP BY c.card_name
+        {hc2_where} GROUP BY c.card_name
     """
-    hc1_rows = c.execute(q_hc1).fetchall()
-    hc2_rows = c.execute(q_hc2).fetchall()
+    hc1_rows = c.execute(q_hc1, inv_params).fetchall()
+    hc2_rows = c.execute(q_hc2, inv_params).fetchall()
     hc2_dict = {r['card_name']: r['cnt2'] for r in hc2_rows}
     
     df_hot_c = []
@@ -703,53 +970,29 @@ def get_dashboard_data_cached(filtro_tempo: str):
     conn.close()
 
     all_names = set()
-    def add_names(names_list, is_cmd):
-        for name in names_list:
-            if is_cmd:
-                if " // " in name: all_names.add(name.split(" // ")[0].strip())
-                elif " / " in name: 
-                    for p in name.split(" / "): all_names.add(p.strip())
-                else: all_names.add(name)
-            else:
-                all_names.add(name.split(" // ")[0].strip())
-
-    add_names([r['comandante'] for r in df_top_cmd], True)
-    add_names([r['comandante'] for r in df_hot_cmd], True)
-    add_names([r['card_name'] for r in df_top_cards], False)
-    add_names([r['card_name'] for r in df_hot_c], False)
+    for r in df_top_cmd: all_names.add(r['comandante'])
+    for r in df_hot_cmd: all_names.add(r['comandante'])
+    for r in df_top_cards: all_names.add(r['card_name'])
+    for r in df_hot_c: all_names.add(r['card_name'])
     
     scryfall_cache = fetch_scryfall_data(list(all_names))
 
     def format_item(row, name_col, is_cmd=False):
         name = row[name_col]
         if is_cmd:
-            if " // " in name: parts = [name.split(" // ")[0].strip()]
-            elif " / " in name: parts = [p.strip() for p in name.split(" / ")]
-            else: parts = [name]
+            _, images, _, _, final_color_identity = extract_commander_metadata(name, scryfall_cache)
+            cat = "Comandante"
         else:
-            parts = [name.split(" // ")[0].strip()]
-
-        images = []
-        cmd_colors = set()
-        for part in parts:
-            info = scryfall_cache.get(part.lower(), {})
-            images.extend(info.get("images", []))
-            if is_cmd:
-                for color in info.get("color_identity", []): cmd_colors.add(color)
-            
-        seen = set()
-        images = [x for x in images if not (x in seen or seen.add(x))]
+            main_info = lookup_card_info(scryfall_cache, name)
+            images = list(dict.fromkeys(main_info.get("images", [])))
+            cat = categorizza_tipo(main_info.get("type", ""))
+            final_color_identity = main_info.get("color_identity", [])
 
         t_val = row.get('trend')
         if t_val is None:
             trend_out = None if prev_cond else ""
         else:
             trend_out = int(t_val) if t_val != "" else ""
-        
-        main_info = scryfall_cache.get(parts[0].lower(), {})
-        cat = categorizza_tipo(main_info.get("type", "")) if not is_cmd else "Comandante"
-        
-        final_color_identity = list(cmd_colors) if is_cmd else main_info.get("color_identity", [])
 
         return {
             "name": name,
@@ -761,8 +1004,15 @@ def get_dashboard_data_cached(filtro_tempo: str):
             "color_identity": final_color_identity
         }
 
+    try:
+        mtime = get_db_mtime()
+        global_last_updated = datetime.fromtimestamp(mtime).isoformat() if mtime else None
+    except Exception:
+        global_last_updated = None
+
     return {
         "total_decks": tot_decks,
+        "last_updated": global_last_updated,
         "top_commanders": [format_item(row, 'comandante', True) for row in df_top_cmd],
         "hot_commanders": [format_item(row, 'comandante', True) for row in df_hot_cmd],
         "top_cards": [format_item(row, 'card_name', False) for row in df_top_cards],
@@ -777,35 +1027,35 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
     except Exception:
         global_last_updated = None
 
-    conn = get_db()
-    c = conn.cursor()
-    valid_commanders, _ = get_valid_commanders_set(filtro_tempo)
-    if not valid_commanders:
-        conn.close()
+    valid_all, invalid_cmds = get_global_commanders_validity()
+    if not valid_all:
         return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
 
-    global_total = c.execute("SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks").fetchone()['tot']
-    gc_rows = c.execute("SELECT card_name, COUNT(DISTINCT deck_id) as g_freq FROM deck_cards GROUP BY card_name").fetchall()
-    global_cards = {r['card_name']: r['g_freq'] for r in gc_rows}
+    if comandante and comandante not in valid_all:
+        return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
+
+    global_total, global_cards = get_global_cards_stats()
+    if global_total == 0:
+        return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
+
+    conn = get_db()
+    c = conn.cursor()
 
     conds = []
     t_cond = get_time_condition(filtro_tempo)
-    if t_cond: conds.append(t_cond)
+    if t_cond:
+        conds.append(t_cond)
     
     params = []
     if comandante:
-        if comandante not in valid_commanders:
-            conn.close()
-            return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
         conds.append("comandante = ?")
         params.append(comandante)
-    else:
-        valid_cmd_list = list(valid_commanders)
-        placeholders_cmd = '(' + ','.join(['?'] * len(valid_cmd_list)) + ')'
-        conds.append(f"comandante IN {placeholders_cmd}")
-        params.extend(valid_cmd_list)
+    elif invalid_cmds:
+        placeholders_inv = '(' + ','.join(['?'] * len(invalid_cmds)) + ')'
+        conds.append(f"comandante NOT IN {placeholders_inv}")
+        params.extend(invalid_cmds)
         
-    where_clause = " WHERE " + " AND ".join(conds)
+    where_clause = (" WHERE " + " AND ".join(conds)) if conds else ""
     
     q_total = f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {where_clause}"
     total_decks = c.execute(q_total, params).fetchone()['tot']
@@ -876,9 +1126,9 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
 
     for row in stats_list:
         c_name = row['card_name']
-        info = scryfall_cache.get(c_name.lower(), {})
+        info = lookup_card_info(scryfall_cache, c_name)
         if not info:
-            info = scryfall_cache.get(c_name.split("//")[0].strip().lower(), {"images": [], "art_crops": [], "type": "Altro", "oracles": [], "color_identity": [], "cmc": 0})
+            info = {"images": [], "art_crops": [], "type": "Altro", "oracles": [], "color_identity": [], "cmc": 0}
             
         cat = categorizza_tipo(info.get("type", ""))
         
@@ -911,7 +1161,9 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
         })
         
     if not qty_col:
-        terre_mancanti = 100.0 - somma_univoche
+        is_partner_cmd = bool(comandante and " / " in comandante and " // " not in comandante)
+        expected_mainboard = 98.0 if is_partner_cmd else 99.0
+        terre_mancanti = expected_mainboard - somma_univoche
         if terre_mancanti > 0:
             type_dist["Terre"] += terre_mancanti
             
@@ -925,56 +1177,81 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
 
 @lru_cache(maxsize=512)
 def get_card_details_cached(card_name: str, filtro_tempo: str):
+    valid_all, invalid_cmds = get_global_commanders_validity()
+    scryfall_cache = load_scryfall_cache()
+    if not lookup_card_info(scryfall_cache, card_name):
+        scryfall_cache = fetch_scryfall_data([card_name])
+    card_info_cache = lookup_card_info(scryfall_cache, card_name)
+
+    if not valid_all:
+        return {
+            "card_name": card_name,
+            "images": card_info_cache.get("images", []),
+            "art_crops": card_info_cache.get("art_crops", []),
+            "oracles": card_info_cache.get("oracles", []),
+            "total_decks_with_card": 0,
+            "total_decks_global": 0,
+            "commanders": [],
+            "synergies": []
+        }
+
     conn = get_db()
     c = conn.cursor()
-    valid_commanders, _ = get_valid_commanders_set(filtro_tempo)
-    if not valid_commanders:
-        conn.close()
-        return {"commanders": [], "synergies": []}
-        
-    valid_cmd_list = list(valid_commanders)
-    placeholders_cmd = '(' + ','.join(['?'] * len(valid_cmd_list)) + ')'
-    
+
+    inv_cond_d = ""
+    inv_cond_plain = ""
+    inv_params = list(invalid_cmds)
+    if invalid_cmds:
+        placeholders_inv = '(' + ','.join(['?'] * len(invalid_cmds)) + ')'
+        inv_cond_d = f" AND d.comandante NOT IN {placeholders_inv}"
+        inv_cond_plain = f" WHERE comandante NOT IN {placeholders_inv}"
+
     t_cond = get_time_condition(filtro_tempo)
     time_filtered_cond = ""
     if t_cond:
         time_filtered_cond = " AND " + t_cond.replace("data_aggiornamento", "d.data_aggiornamento")
 
-    q_tot_glob = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ? AND d.comandante IN {placeholders_cmd}"
-    total_decks_global = c.execute(q_tot_glob, [card_name] + valid_cmd_list).fetchone()['tot']
+    q_tot_glob = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}"
+    total_decks_global = c.execute(q_tot_glob, [card_name] + inv_params).fetchone()['tot']
     
     if total_decks_global == 0:
         conn.close()
         return {
-            "card_name": card_name, "images": [], "art_crops": [],
-            "oracles": [], "total_decks_with_card": 0, "total_decks_global": 0,
-            "commanders": [], "synergies": []
+            "card_name": card_name,
+            "images": card_info_cache.get("images", []),
+            "art_crops": card_info_cache.get("art_crops", []),
+            "oracles": card_info_cache.get("oracles", []),
+            "total_decks_with_card": 0,
+            "total_decks_global": 0,
+            "commanders": [],
+            "synergies": []
         }
     
-    q_tot_time = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ? AND d.comandante IN {placeholders_cmd} {time_filtered_cond}"
-    total_decks_time = c.execute(q_tot_time, [card_name] + valid_cmd_list).fetchone()['tot']
-
-    scryfall_cache = load_scryfall_cache()
-    if card_name.lower() not in scryfall_cache:
-        scryfall_cache = fetch_scryfall_data([card_name])
-
-    card_info_cache = scryfall_cache.get(card_name.lower(), {})
-    if not card_info_cache:
-        card_info_cache = scryfall_cache.get(card_name.split("//")[0].strip().lower(), {})
+    q_tot_time = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond}"
+    total_decks_time = c.execute(q_tot_time, [card_name] + inv_params).fetchone()['tot']
 
     if total_decks_time == 0:
         conn.close()
         return {
-            "card_name": card_name, "images": card_info_cache.get("images", []), "art_crops": card_info_cache.get("art_crops", []),
-            "oracles": card_info_cache.get("oracles", []), "total_decks_with_card": 0, "total_decks_global": total_decks_global,
-            "commanders": [], "synergies": []
+            "card_name": card_name,
+            "images": card_info_cache.get("images", []),
+            "art_crops": card_info_cache.get("art_crops", []),
+            "oracles": card_info_cache.get("oracles", []),
+            "total_decks_with_card": 0,
+            "total_decks_global": total_decks_global,
+            "commanders": [],
+            "synergies": []
         }
         
-    q_cmd = f"SELECT d.comandante, COUNT(DISTINCT d.id_moxfield) as mazzi_carta FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ? AND d.comandante IN {placeholders_cmd} {time_filtered_cond} GROUP BY d.comandante"
-    cmd_counts = c.execute(q_cmd, [card_name] + valid_cmd_list).fetchall()
+    q_cmd = f"SELECT d.comandante, COUNT(DISTINCT d.id_moxfield) as mazzi_carta FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond} GROUP BY d.comandante"
+    cmd_counts = c.execute(q_cmd, [card_name] + inv_params).fetchall()
     
-    q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d WHERE comandante IN {placeholders_cmd} {time_filtered_cond} GROUP BY comandante"
-    total_counts = c.execute(q_tot_cmd, valid_cmd_list).fetchall()
+    if inv_cond_plain:
+        q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d{inv_cond_plain}{time_filtered_cond} GROUP BY comandante"
+    else:
+        where_time_only = f" WHERE {t_cond.replace('data_aggiornamento', 'd.data_aggiornamento')}" if t_cond else ""
+        q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d{where_time_only} GROUP BY comandante"
+    total_counts = c.execute(q_tot_cmd, inv_params).fetchall()
     tot_map = {r['comandante']: r['totale_comandante'] for r in total_counts}
     
     res_cmd = []
@@ -997,18 +1274,15 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
     cmd_list = []
     for row in res_cmd:
         name = row['comandante']
-        parts = [p.strip() for p in name.split(" / ")] if " / " in name else ([p.strip() for p in name.split(" // ")] if " // " in name else [name.strip()])
-        images, art_crops, seen_images, seen_art_crops = [], [], set(), set()
-        for part in parts:
-            info = scryfall_cache.get(part.lower(), {})
-            for img in info.get("images", []):
-                if img not in seen_images: seen_images.add(img); images.append(img)
-            for ac in info.get("art_crops", []):
-                if ac not in seen_art_crops: seen_art_crops.add(ac); art_crops.append(ac)
+        _, images, art_crops, _, _ = extract_commander_metadata(name, scryfall_cache)
 
         cmd_list.append({
-            "comandante": name, "mazzi_carta": int(row['mazzi_carta']), "totale_comandante": int(row['totale_comandante']),
-            "Percentuale": float(row['Percentuale']), "images": images, "art_crops": art_crops
+            "comandante": name,
+            "mazzi_carta": int(row['mazzi_carta']),
+            "totale_comandante": int(row['totale_comandante']),
+            "Percentuale": float(row['Percentuale']),
+            "images": images,
+            "art_crops": art_crops
         })
         
     syn_query = f"""
@@ -1018,12 +1292,12 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
         WHERE d.id_moxfield IN (
             SELECT deck_id FROM deck_cards WHERE card_name = ?
         )
-        AND d.comandante IN {placeholders_cmd}
+        {inv_cond_d}
         {time_filtered_cond}
         AND c.card_name != ?
         GROUP BY c.card_name
     """
-    syn_params = [card_name] + valid_cmd_list + [card_name]
+    syn_params = [card_name] + inv_params + [card_name]
     syn_rows = c.execute(syn_query, syn_params).fetchall()
     conn.close()
     
@@ -1043,23 +1317,38 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
     syn_formatted = []
     for row in syn_df:
         cn = row['card_name']
-        inf = syn_cache.get(cn.lower(), {})
-        if not inf: inf = syn_cache.get(cn.split("//")[0].strip().lower(), {"images": [], "art_crops": [], "type": "Altro", "oracles": [], "color_identity": []})
+        inf = lookup_card_info(syn_cache, cn)
+        if not inf:
+            inf = {"images": [], "art_crops": [], "type": "Altro", "oracles": [], "color_identity": []}
             
         syn_formatted.append({
-            "card_name": cn, "freq": int(row['freq']), "Percentuale": float(row['Percentuale']),
-            "images": inf.get("images", []), "art_crops": inf.get("art_crops", []), "oracles": inf.get("oracles", []),
-            "color_identity": inf.get("color_identity", []), "category": categorizza_tipo(inf.get("type", ""))
+            "card_name": cn,
+            "freq": int(row['freq']),
+            "Percentuale": float(row['Percentuale']),
+            "images": inf.get("images", []),
+            "art_crops": inf.get("art_crops", []),
+            "oracles": inf.get("oracles", []),
+            "color_identity": inf.get("color_identity", []),
+            "category": categorizza_tipo(inf.get("type", ""))
         })
         
     return {
-        "card_name": card_name, "images": card_info_cache.get("images", []), "art_crops": card_info_cache.get("art_crops", []),
-        "oracles": card_info_cache.get("oracles", []), "total_decks_with_card": total_decks_time, "total_decks_global": total_decks_global,
-        "commanders": cmd_list[:15], "synergies": syn_formatted
+        "card_name": card_name,
+        "images": card_info_cache.get("images", []),
+        "art_crops": card_info_cache.get("art_crops", []),
+        "oracles": card_info_cache.get("oracles", []),
+        "total_decks_with_card": total_decks_time,
+        "total_decks_global": total_decks_global,
+        "commanders": cmd_list[:15],
+        "synergies": syn_formatted
     }
 
 @lru_cache(maxsize=256)
 def get_commander_decks_cached(comandante: str, filtro_tempo: str, limit: int = 0, offset: int = 0):
+    valid_all, _ = get_global_commanders_validity()
+    if comandante not in valid_all:
+        return []
+
     conn = get_db()
     c = conn.cursor()
     conds = ["comandante = ?"]

@@ -1571,6 +1571,33 @@ _COMMUNITY_POOL_DATE = ""
 _COMMUNITY_CORE_100 = []
 _COMMUNITY_DAILY_50 = []
 _COMMUNITY_FALLBACK_ALL = []
+_DECKS_COUNT_30D_CACHE = {}
+_DECKS_COUNT_30D_DATE = ""
+
+def get_card_30d_decks_count(card_name: str) -> int:
+    global _DECKS_COUNT_30D_CACHE, _DECKS_COUNT_30D_DATE
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if _DECKS_COUNT_30D_DATE != today_str:
+        _DECKS_COUNT_30D_CACHE.clear()
+        _DECKS_COUNT_30D_DATE = today_str
+
+    if card_name in _DECKS_COUNT_30D_CACHE:
+        return _DECKS_COUNT_30D_CACHE[card_name]
+
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        date_limit_30d = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        cnt = c.execute("""
+            SELECT COUNT(DISTINCT d.id_moxfield) as cnt 
+            FROM deck_cards dc
+            JOIN decks d ON dc.deck_id = d.id_moxfield
+            WHERE dc.card_name = ? AND d.data_aggiornamento >= ?
+        """, (card_name, date_limit_30d)).fetchone()['cnt']
+        _DECKS_COUNT_30D_CACHE[card_name] = cnt
+        return cnt
+    finally:
+        conn.close()
 
 def get_community_card_pools():
     global _COMMUNITY_POOL_DATE, _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
@@ -1672,19 +1699,8 @@ def get_random_community_card(voter_hash: str):
         scryfall_cache = fetch_scryfall_data([chosen_card])
         info = lookup_card_info(scryfall_cache, chosen_card) or {}
 
-    # Calcola il numero di mazzi negli ultimi 30 giorni in cui compare la carta
-    conn = get_db()
-    c = conn.cursor()
-    try:
-        date_limit_30d = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        decks_count = c.execute("""
-            SELECT COUNT(DISTINCT d.id_moxfield) as cnt 
-            FROM deck_cards dc
-            JOIN decks d ON dc.deck_id = d.id_moxfield
-            WHERE dc.card_name = ? AND d.data_aggiornamento >= ?
-        """, (chosen_card, date_limit_30d)).fetchone()['cnt']
-    finally:
-        conn.close()
+    # Calcola il numero di mazzi negli ultimi 30 giorni in cui compare la carta (in-memory cache)
+    decks_count = get_card_30d_decks_count(chosen_card)
 
     # Statistiche di valutazione attuali per questa carta
     comm_conn = get_community_db()

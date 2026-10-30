@@ -1672,11 +1672,17 @@ def get_random_community_card(voter_hash: str):
         scryfall_cache = fetch_scryfall_data([chosen_card])
         info = lookup_card_info(scryfall_cache, chosen_card) or {}
 
-    # Calcola il numero di mazzi in cui compare la carta
+    # Calcola il numero di mazzi negli ultimi 30 giorni in cui compare la carta
     conn = get_db()
     c = conn.cursor()
     try:
-        decks_count = c.execute("SELECT COUNT(DISTINCT deck_id) as cnt FROM deck_cards WHERE card_name = ?", (chosen_card,)).fetchone()['cnt']
+        date_limit_30d = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        decks_count = c.execute("""
+            SELECT COUNT(DISTINCT d.id_moxfield) as cnt 
+            FROM deck_cards dc
+            JOIN decks d ON dc.deck_id = d.id_moxfield
+            WHERE dc.card_name = ? AND d.data_aggiornamento >= ?
+        """, (chosen_card, date_limit_30d)).fetchone()['cnt']
     finally:
         conn.close()
 

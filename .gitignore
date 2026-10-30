@@ -3,8 +3,13 @@ __pycache__/
 venv/
 
 # Database (Dati di produzione)
-centurion.db
+centurion.db*
+community.db*
+health.db*
 *.db
+*.db-*
+*.sqlite
+*.sqlite3
 
 # Cache temporanee e File di Log
 scryfall_cache.json

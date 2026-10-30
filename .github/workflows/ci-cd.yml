@@ -1,0 +1,63 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  ci:
+    name: Lint & Validation (Cloud)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint for syntax and critical errors
+        run: ruff check --select E9,F63,F7,F82 .
+
+      - name: Compile and smoke test
+        run: |
+          python -m py_compile main.py master_scraper.py
+          python -c "import main; print('FastAPI main module verified successfully')"
+
+  deploy:
+    name: Deploy to Production (Debian Runner)
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: self-hosted
+    steps:
+      - name: Pull changes and reload service
+        run: |
+          echo "[Deploy] Navigazione nella directory di produzione..."
+          cd /home/CenturionREC
+          
+          echo "[Deploy] Git pull da main..."
+          git pull origin main
+          
+          echo "[Deploy] Aggiornamento dipendenze nel venv..."
+          source venv/bin/activate
+          pip install -r requirements.txt
+          
+          echo "[Deploy] Riavvio servizio CentMeta..."
+          if command -v sudo >/dev/null 2>&1; then
+            sudo systemctl restart centmeta.service
+          else
+            systemctl restart centmeta.service
+          fi
+          
+          echo "[Deploy] Deploy completato con successo!"
+

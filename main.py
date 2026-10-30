@@ -7,13 +7,16 @@ import time as std_time
 import threading
 import logging
 import secrets
+import hashlib
+import random
 from datetime import datetime, time, timedelta
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from pydantic import BaseModel, Field
 import master_scraper
 
 try:
@@ -40,6 +43,12 @@ def get_db():
 
 def get_health_db():
     conn = sqlite3.connect(HEALTH_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+def get_community_db():
+    conn = sqlite3.connect(COMMUNITY_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn
@@ -152,6 +161,43 @@ def setup_health_db(init_main_blacklist: bool = True):
     ''')
     h_conn.commit()
     h_conn.close()
+
+def setup_community_db():
+    conn = get_community_db()
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS community_ratings (
+                card_name TEXT PRIMARY KEY,
+                total_votes INTEGER NOT NULL DEFAULT 0,
+                score_sum INTEGER NOT NULL DEFAULT 0,
+                avg_score REAL NOT NULL DEFAULT 0.0,
+                stars_1 INTEGER NOT NULL DEFAULT 0,
+                stars_2 INTEGER NOT NULL DEFAULT 0,
+                stars_3 INTEGER NOT NULL DEFAULT 0,
+                stars_4 INTEGER NOT NULL DEFAULT 0,
+                stars_5 INTEGER NOT NULL DEFAULT 0,
+                last_voted_at TEXT
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS community_votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_name TEXT NOT NULL,
+                voter_hash TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(voter_hash, card_name)
+            )
+        ''')
+        c.execute("CREATE INDEX IF NOT EXISTS idx_community_votes_voter ON community_votes(voter_hash)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_community_votes_card ON community_votes(card_name)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_community_ratings_avg ON community_ratings(avg_score DESC, total_votes DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_community_ratings_votes ON community_ratings(total_votes DESC)")
+        conn.commit()
+    finally:
+        conn.close()
 
 def _perform_health_pings():
     setup_health_db(init_main_blacklist=False)
@@ -283,7 +329,9 @@ async def background_db_updater():
 CARTELLA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
 HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db")
+COMMUNITY_DB_PATH = os.path.join(CARTELLA_SCRIPT, "community.db")
 CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
+COMMUNITY_SALT = os.getenv("COMMUNITY_SALT", "centmeta_community_salt_secret_2026")
 
 _SCRYFALL_CACHE_MEMORY = None
 
@@ -309,6 +357,7 @@ async def lifespan(app: FastAPI):
         conn.close()
 
     setup_health_db(init_main_blacklist=True)
+    setup_community_db()
     sanitize_commanders_in_db()
     setup_database_indices()
 
@@ -1487,3 +1536,360 @@ async def remove_deck(
         raise HTTPException(status_code=500, detail="Errore interno durante l'operazione")
     finally:
         conn.close()
+
+# ==============================================================================
+# COMMUNITY RATING SYSTEM ("Tutte le carte di magic sono scarse tranne le carte forti")
+# ==============================================================================
+
+BASIC_LANDS = {
+    "plains", "island", "swamp", "mountain", "forest", "wastes",
+    "snow-covered plains", "snow-covered island", "snow-covered swamp",
+    "snow-covered mountain", "snow-covered forest"
+}
+
+def get_client_ip(request: Request) -> str:
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        return x_forwarded_for.split(",")[0].strip()
+    x_real_ip = request.headers.get("x-real-ip")
+    if x_real_ip:
+        return x_real_ip.strip()
+    if request.client:
+        return request.client.host
+    return "127.0.0.1"
+
+def get_voter_hash(request: Request) -> str:
+    ip = get_client_ip(request)
+    ua = request.headers.get("user-agent", "")
+    payload = f"{COMMUNITY_SALT}:{ip}:{ua}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+_COMMUNITY_CARDS_RECENT = []
+_COMMUNITY_CARDS_ALL = []
+_COMMUNITY_CARDS_TIMESTAMP = 0
+
+def get_community_card_pools():
+    global _COMMUNITY_CARDS_RECENT, _COMMUNITY_CARDS_ALL, _COMMUNITY_CARDS_TIMESTAMP
+    now = std_time.time()
+    if _COMMUNITY_CARDS_RECENT and _COMMUNITY_CARDS_ALL and (now - _COMMUNITY_CARDS_TIMESTAMP < 600):
+        return _COMMUNITY_CARDS_RECENT, _COMMUNITY_CARDS_ALL
+
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        date_limit = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        rows_recent = c.execute("""
+            SELECT DISTINCT dc.card_name 
+            FROM deck_cards dc
+            JOIN decks d ON dc.deck_id = d.id_moxfield
+            WHERE d.data_aggiornamento >= ?
+        """, (date_limit,)).fetchall()
+        recent_cards = [r['card_name'] for r in rows_recent if r['card_name'].lower() not in BASIC_LANDS]
+
+        rows_all = c.execute("""
+            SELECT DISTINCT card_name FROM deck_cards
+        """).fetchall()
+        all_cards = [r['card_name'] for r in rows_all if r['card_name'].lower() not in BASIC_LANDS]
+
+        _COMMUNITY_CARDS_RECENT = recent_cards if recent_cards else all_cards
+        _COMMUNITY_CARDS_ALL = all_cards
+        _COMMUNITY_CARDS_TIMESTAMP = now
+        return _COMMUNITY_CARDS_RECENT, _COMMUNITY_CARDS_ALL
+    finally:
+        conn.close()
+
+def get_random_community_card(voter_hash: str):
+    recent_cards, all_cards = get_community_card_pools()
+    if not all_cards:
+        raise HTTPException(status_code=404, detail="Nessuna carta disponibile nel database")
+
+    # Ottieni le carte già votate da questo utente
+    comm_conn = get_community_db()
+    c_comm = comm_conn.cursor()
+    try:
+        voted_rows = c_comm.execute("SELECT card_name FROM community_votes WHERE voter_hash = ?", (voter_hash,)).fetchall()
+        voted_set = {r['card_name'] for r in voted_rows}
+    finally:
+        comm_conn.close()
+
+    # 70% di probabilità per carte giocate negli ultimi 30 giorni, 30% per il pool globale
+    use_recent = (random.random() < 0.70) and len(recent_cards) > 0
+    pool = recent_cards if use_recent else all_cards
+
+    # Preferisci carte non ancora votate da questo utente
+    unvoted = [card for card in pool if card not in voted_set]
+    chosen_card = random.choice(unvoted) if unvoted else random.choice(pool)
+
+    # Recupera i dettagli Scryfall
+    scryfall_cache = load_scryfall_cache()
+    info = lookup_card_info(scryfall_cache, chosen_card)
+    if not info:
+        scryfall_cache = fetch_scryfall_data([chosen_card])
+        info = lookup_card_info(scryfall_cache, chosen_card) or {}
+
+    # Calcola il numero di mazzi in cui compare la carta
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        decks_count = c.execute("SELECT COUNT(DISTINCT deck_id) as cnt FROM deck_cards WHERE card_name = ?", (chosen_card,)).fetchone()['cnt']
+    finally:
+        conn.close()
+
+    # Statistiche di valutazione attuali per questa carta
+    comm_conn = get_community_db()
+    c_comm = comm_conn.cursor()
+    try:
+        r_row = c_comm.execute("""
+            SELECT total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5
+            FROM community_ratings WHERE card_name = ?
+        """, (chosen_card,)).fetchone()
+
+        user_vote_row = c_comm.execute("""
+            SELECT score FROM community_votes WHERE voter_hash = ? AND card_name = ?
+        """, (voter_hash, chosen_card)).fetchone()
+    finally:
+        comm_conn.close()
+
+    community_stats = {
+        "total_votes": r_row['total_votes'] if r_row else 0,
+        "avg_score": r_row['avg_score'] if r_row else 0.0,
+        "stars_breakdown": {
+            1: r_row['stars_1'] if r_row else 0,
+            2: r_row['stars_2'] if r_row else 0,
+            3: r_row['stars_3'] if r_row else 0,
+            4: r_row['stars_4'] if r_row else 0,
+            5: r_row['stars_5'] if r_row else 0,
+        },
+        "user_score": user_vote_row['score'] if user_vote_row else None
+    }
+
+    return {
+        "card_name": chosen_card,
+        "images": info.get("images", []),
+        "art_crops": info.get("art_crops", []),
+        "oracles": info.get("oracles", []),
+        "type": info.get("type", "Carta"),
+        "cmc": info.get("cmc", 0.0),
+        "color_identity": info.get("color_identity", []),
+        "decks_count": decks_count,
+        "is_recent_pool": chosen_card in recent_cards,
+        "community_stats": community_stats
+    }
+
+class VotePayload(BaseModel):
+    card_name: str
+    score: int = Field(..., ge=1, le=5)
+
+def record_community_vote(card_name: str, score: int, voter_hash: str):
+    comm_conn = get_community_db()
+    c = comm_conn.cursor()
+    now = datetime.now().isoformat()
+    try:
+        prev = c.execute(
+            "SELECT score FROM community_votes WHERE voter_hash = ? AND card_name = ?",
+            (voter_hash, card_name)
+        ).fetchone()
+
+        if prev:
+            old_score = prev['score']
+            if old_score != score:
+                score_diff = score - old_score
+                c.execute("""
+                    UPDATE community_votes 
+                    SET score = ?, created_at = ? 
+                    WHERE voter_hash = ? AND card_name = ?
+                """, (score, now, voter_hash, card_name))
+
+                star_old = f"stars_{old_score}"
+                star_new = f"stars_{score}"
+                c.execute(f"""
+                    UPDATE community_ratings
+                    SET score_sum = score_sum + ?,
+                        {star_old} = {star_old} - 1,
+                        {star_new} = {star_new} + 1,
+                        avg_score = ROUND(CAST(score_sum + ? AS REAL) / total_votes, 2),
+                        last_voted_at = ?
+                    WHERE card_name = ?
+                """, (score_diff, score_diff, now, card_name))
+        else:
+            c.execute("""
+                INSERT INTO community_votes (card_name, voter_hash, score, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (card_name, voter_hash, score, now))
+
+            star_col = f"stars_{score}"
+            c.execute(f"""
+                INSERT INTO community_ratings (card_name, total_votes, score_sum, avg_score, {star_col}, last_voted_at)
+                VALUES (?, 1, ?, ?, 1, ?)
+                ON CONFLICT(card_name) DO UPDATE SET
+                    total_votes = total_votes + 1,
+                    score_sum = score_sum + excluded.score_sum,
+                    {star_col} = {star_col} + 1,
+                    avg_score = ROUND(CAST(score_sum + excluded.score_sum AS REAL) / (total_votes + 1), 2),
+                    last_voted_at = excluded.last_voted_at
+            """, (card_name, score, float(score), now))
+
+        comm_conn.commit()
+
+        updated = c.execute("""
+            SELECT total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5
+            FROM community_ratings WHERE card_name = ?
+        """, (card_name,)).fetchone()
+
+        return {
+            "status": "success",
+            "card_name": card_name,
+            "user_score": score,
+            "total_votes": updated['total_votes'] if updated else 1,
+            "avg_score": updated['avg_score'] if updated else float(score),
+            "stars_breakdown": {
+                1: updated['stars_1'] if updated else 0,
+                2: updated['stars_2'] if updated else 0,
+                3: updated['stars_3'] if updated else 0,
+                4: updated['stars_4'] if updated else 0,
+                5: updated['stars_5'] if updated else 0
+            }
+        }
+    finally:
+        comm_conn.close()
+
+def get_community_leaderboard(sort: str = "highest", min_votes: int = 2, limit: int = 50, offset: int = 0):
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    min_votes = max(1, min_votes)
+
+    order_clause = "ORDER BY avg_score DESC, total_votes DESC"
+    if sort == "most_voted":
+        order_clause = "ORDER BY total_votes DESC, avg_score DESC"
+    elif sort == "lowest":
+        order_clause = "ORDER BY avg_score ASC, total_votes DESC"
+
+    comm_conn = get_community_db()
+    c = comm_conn.cursor()
+    try:
+        total_count = c.execute("SELECT COUNT(*) as cnt FROM community_ratings WHERE total_votes >= ?", (min_votes,)).fetchone()['cnt']
+        
+        query = f"""
+            SELECT card_name, total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5, last_voted_at
+            FROM community_ratings
+            WHERE total_votes >= ?
+            {order_clause}
+            LIMIT ? OFFSET ?
+        """
+        rows = c.execute(query, (min_votes, limit, offset)).fetchall()
+    finally:
+        comm_conn.close()
+
+    scryfall_cache = load_scryfall_cache()
+    missing_names = [r['card_name'] for r in rows if not lookup_card_info(scryfall_cache, r['card_name'])]
+    if missing_names:
+        scryfall_cache = fetch_scryfall_data(missing_names)
+
+    items = []
+    for r in rows:
+        cn = r['card_name']
+        info = lookup_card_info(scryfall_cache, cn) or {}
+        items.append({
+            "card_name": cn,
+            "total_votes": r['total_votes'],
+            "avg_score": r['avg_score'],
+            "stars_breakdown": {
+                1: r['stars_1'],
+                2: r['stars_2'],
+                3: r['stars_3'],
+                4: r['stars_4'],
+                5: r['stars_5']
+            },
+            "last_voted_at": r['last_voted_at'],
+            "images": info.get("images", []),
+            "art_crops": info.get("art_crops", []),
+            "type": info.get("type", "Carta"),
+            "cmc": info.get("cmc", 0.0),
+            "color_identity": info.get("color_identity", [])
+        })
+
+    return {
+        "total": total_count,
+        "items": items,
+        "sort": sort,
+        "min_votes": min_votes
+    }
+
+def get_community_overview():
+    comm_conn = get_community_db()
+    c = comm_conn.cursor()
+    try:
+        total_votes = c.execute("SELECT COUNT(*) as cnt FROM community_votes").fetchone()['cnt']
+        total_cards_rated = c.execute("SELECT COUNT(*) as cnt FROM community_ratings WHERE total_votes > 0").fetchone()['cnt']
+
+        # Top 3 per media
+        top_rows = c.execute("""
+            SELECT card_name, total_votes, avg_score
+            FROM community_ratings
+            WHERE total_votes >= (CASE WHEN (SELECT COUNT(*) FROM community_ratings WHERE total_votes >= 2) > 0 THEN 2 ELSE 1 END)
+            ORDER BY avg_score DESC, total_votes DESC
+            LIMIT 3
+        """).fetchall()
+
+        # Top 3 più votate
+        most_voted_rows = c.execute("""
+            SELECT card_name, total_votes, avg_score
+            FROM community_ratings
+            WHERE total_votes > 0
+            ORDER BY total_votes DESC, avg_score DESC
+            LIMIT 3
+        """).fetchall()
+    finally:
+        comm_conn.close()
+
+    scryfall_cache = load_scryfall_cache()
+    all_needed = list(set([r['card_name'] for r in top_rows] + [r['card_name'] for r in most_voted_rows]))
+    missing = [name for name in all_needed if not lookup_card_info(scryfall_cache, name)]
+    if missing:
+        scryfall_cache = fetch_scryfall_data(missing)
+
+    def format_mini(row):
+        cn = row['card_name']
+        info = lookup_card_info(scryfall_cache, cn) or {}
+        return {
+            "card_name": cn,
+            "total_votes": row['total_votes'],
+            "avg_score": row['avg_score'],
+            "images": info.get("images", []),
+            "art_crops": info.get("art_crops", [])
+        }
+
+    return {
+        "total_votes": total_votes,
+        "total_cards_rated": total_cards_rated,
+        "top_rated": [format_mini(r) for r in top_rows],
+        "most_voted": [format_mini(r) for r in most_voted_rows]
+    }
+
+@app.get("/api/community/card/random")
+async def api_community_card_random(request: Request):
+    voter_hash = get_voter_hash(request)
+    return await run_in_threadpool(get_random_community_card, voter_hash)
+
+@app.post("/api/community/rate")
+async def api_community_rate(payload: VotePayload, request: Request):
+    voter_hash = get_voter_hash(request)
+    return await run_in_threadpool(record_community_vote, payload.card_name, payload.score, voter_hash)
+
+@app.get("/api/community/leaderboard")
+async def api_community_leaderboard(
+    sort: str = "highest",
+    min_votes: int = 1,
+    limit: int = 50,
+    offset: int = 0
+):
+    if sort not in ("highest", "most_voted", "lowest"):
+        sort = "highest"
+    return await run_in_threadpool(get_community_leaderboard, sort, min_votes, limit, offset)
+
+@app.get("/api/community/overview")
+async def api_community_overview():
+    return await run_in_threadpool(get_community_overview)

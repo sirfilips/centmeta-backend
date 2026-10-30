@@ -1567,61 +1567,103 @@ def get_voter_hash(request: Request) -> str:
     payload = f"{COMMUNITY_SALT}:{ip}:{ua}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-_COMMUNITY_CARDS_RECENT = []
-_COMMUNITY_CARDS_ALL = []
-_COMMUNITY_CARDS_TIMESTAMP = 0
+_COMMUNITY_POOL_DATE = ""
+_COMMUNITY_CORE_100 = []
+_COMMUNITY_DAILY_50 = []
+_COMMUNITY_FALLBACK_ALL = []
 
 def get_community_card_pools():
-    global _COMMUNITY_CARDS_RECENT, _COMMUNITY_CARDS_ALL, _COMMUNITY_CARDS_TIMESTAMP
-    now = std_time.time()
-    if _COMMUNITY_CARDS_RECENT and _COMMUNITY_CARDS_ALL and (now - _COMMUNITY_CARDS_TIMESTAMP < 600):
-        return _COMMUNITY_CARDS_RECENT, _COMMUNITY_CARDS_ALL
+    global _COMMUNITY_POOL_DATE, _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if _COMMUNITY_POOL_DATE == today_str and _COMMUNITY_CORE_100 and _COMMUNITY_DAILY_50:
+        return _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
 
     conn = get_db()
     c = conn.cursor()
     try:
-        date_limit = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        rows_recent = c.execute("""
-            SELECT DISTINCT dc.card_name 
+        # Peschiamo le carte dai mazzi aggiornati negli ultimi 60 giorni, ordinate per diffusione
+        date_limit = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+        rows = c.execute("""
+            SELECT dc.card_name, COUNT(DISTINCT d.id_moxfield) as cnt
             FROM deck_cards dc
             JOIN decks d ON dc.deck_id = d.id_moxfield
             WHERE d.data_aggiornamento >= ?
+            GROUP BY dc.card_name
+            ORDER BY cnt DESC
         """, (date_limit,)).fetchall()
-        recent_cards = [r['card_name'] for r in rows_recent if r['card_name'].lower() not in BASIC_LANDS]
 
-        rows_all = c.execute("""
-            SELECT DISTINCT card_name FROM deck_cards
-        """).fetchall()
-        all_cards = [r['card_name'] for r in rows_all if r['card_name'].lower() not in BASIC_LANDS]
+        filtered_cards = [r['card_name'] for r in rows if r['card_name'].lower() not in BASIC_LANDS]
 
-        _COMMUNITY_CARDS_RECENT = recent_cards if recent_cards else all_cards
-        _COMMUNITY_CARDS_ALL = all_cards
-        _COMMUNITY_CARDS_TIMESTAMP = now
-        return _COMMUNITY_CARDS_RECENT, _COMMUNITY_CARDS_ALL
+        # Top 100 fisse (le colonne portanti del meta)
+        core_100 = filtered_cards[:100]
+
+        # 50 carte a rotazione giornaliera pescate deterministicamente tra le posizioni 101 e 600
+        rotation_candidates = filtered_cards[100:600]
+        if not rotation_candidates:
+            rotation_candidates = filtered_cards[100:]
+
+        rng = random.Random(f"centmeta-daily-{today_str}")
+        if len(rotation_candidates) >= 50:
+            daily_50 = rng.sample(rotation_candidates, 50)
+        else:
+            daily_50 = rotation_candidates
+
+        # Fallback completo (tutte le carte non base del catalogo) per utenti che completano il pool
+        rows_all = c.execute("SELECT DISTINCT card_name FROM deck_cards").fetchall()
+        fallback_all = [r['card_name'] for r in rows_all if r['card_name'].lower() not in BASIC_LANDS]
+
+        _COMMUNITY_POOL_DATE = today_str
+        _COMMUNITY_CORE_100 = core_100
+        _COMMUNITY_DAILY_50 = daily_50
+        _COMMUNITY_FALLBACK_ALL = fallback_all
+        return _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
     finally:
         conn.close()
 
 def get_random_community_card(voter_hash: str):
-    recent_cards, all_cards = get_community_card_pools()
-    if not all_cards:
+    core_100, daily_50, fallback_all = get_community_card_pools()
+    today_active_pool = core_100 + daily_50
+
+    if not today_active_pool:
+        today_active_pool = fallback_all
+    if not today_active_pool:
         raise HTTPException(status_code=404, detail="Nessuna carta disponibile nel database")
 
-    # Ottieni le carte già votate da questo utente
+    # Ottieni le carte già votate da questo utente e quelle in fase di consolidamento (1-4 voti totali)
     comm_conn = get_community_db()
     c_comm = comm_conn.cursor()
     try:
         voted_rows = c_comm.execute("SELECT card_name FROM community_votes WHERE voter_hash = ?", (voter_hash,)).fetchall()
         voted_set = {r['card_name'] for r in voted_rows}
+
+        partial_rows = c_comm.execute("""
+            SELECT card_name FROM community_ratings 
+            WHERE total_votes >= 1 AND total_votes < 5
+        """).fetchall()
+        partial_votes_set = {r['card_name'] for r in partial_rows}
     finally:
         comm_conn.close()
 
-    # 70% di probabilità per carte giocate negli ultimi 30 giorni, 30% per il pool globale
-    use_recent = (random.random() < 0.70) and len(recent_cards) > 0
-    pool = recent_cards if use_recent else all_cards
+    # Filtra le carte non ancora votate da questo utente tra le 150 attive oggi
+    unvoted_pool = [card for card in today_active_pool if card not in voted_set]
 
-    # Preferisci carte non ancora votate da questo utente
-    unvoted = [card for card in pool if card not in voted_set]
-    chosen_card = random.choice(unvoted) if unvoted else random.choice(pool)
+    # Se l'utente ha già votato tutte le 150 del giorno, pesca dal catalogo generale
+    if not unvoted_pool:
+        unvoted_pool = [card for card in fallback_all if card not in voted_set]
+        if not unvoted_pool:
+            # Ha votato tutte le carte esistenti: ricomincia dal pool di oggi
+            unvoted_pool = today_active_pool
+
+    # CACCIA AL QUORUM: 65% di probabilità di proporre una carta che ha già 1-4 voti per portarla a 5
+    quorum_candidates = [card for card in unvoted_pool if card in partial_votes_set]
+    if quorum_candidates and random.random() < 0.65:
+        chosen_card = random.choice(quorum_candidates)
+    else:
+        chosen_card = random.choice(unvoted_pool)
+
+    # Identificazione tipologia carta nel pool odierno
+    is_core_staple = chosen_card in core_100
+    is_daily_spotlight = chosen_card in daily_50
 
     # Recupera i dettagli Scryfall
     scryfall_cache = load_scryfall_cache()
@@ -1675,7 +1717,9 @@ def get_random_community_card(voter_hash: str):
         "cmc": info.get("cmc", 0.0),
         "color_identity": info.get("color_identity", []),
         "decks_count": decks_count,
-        "is_recent_pool": chosen_card in recent_cards,
+        "is_core_staple": is_core_staple,
+        "is_daily_spotlight": is_daily_spotlight,
+        "is_recent_pool": is_core_staple or is_daily_spotlight,
         "community_stats": community_stats
     }
 

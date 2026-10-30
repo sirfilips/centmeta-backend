@@ -1948,7 +1948,7 @@ async def api_community_rate(payload: VotePayload, request: Request):
 @app.get("/api/community/leaderboard")
 async def api_community_leaderboard(
     sort: str = "highest",
-    min_votes: int = 1,
+    min_votes: int = 2,
     limit: int = 50,
     offset: int = 0
 ):

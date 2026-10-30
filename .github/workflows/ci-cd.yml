@@ -46,17 +46,17 @@ jobs:
           cd /home/CenturionREC
           
           echo "[Deploy] Git pull da main..."
-          git pull origin main
+          git pull --ff-only origin main
           
           echo "[Deploy] Aggiornamento dipendenze nel venv..."
           source venv/bin/activate
           pip install -r requirements.txt
           
-          echo "[Deploy] Riavvio servizio CentMeta..."
+          echo "[Deploy] Riavvio servizio CentMeta (centurionrec)..."
           if command -v sudo >/dev/null 2>&1; then
-            sudo systemctl restart centmeta.service
+            sudo systemctl restart centurionrec.service
           else
-            systemctl restart centmeta.service
+            systemctl restart centurionrec.service
           fi
           
           echo "[Deploy] Deploy completato con successo!"

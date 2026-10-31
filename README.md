@@ -8,12 +8,15 @@
   <a href="https://www.sqlite.org/"><img src="https://img.shields.io/badge/SQLite-WAL_Mode-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite WAL" /></a>
   <a href="https://www.moxfield.com/"><img src="https://img.shields.io/badge/Decklists-Moxfield-582CD6?style=for-the-badge" alt="Moxfield" /></a>
   <a href="https://scryfall.com/"><img src="https://img.shields.io/badge/Cards-Scryfall_API-2B2D42?style=for-the-badge" alt="Scryfall API" /></a>
+  <a href="https://github.com/sirfilips/centmeta-frontend"><img src="https://img.shields.io/badge/Frontend_Repo-Next.js-black?style=for-the-badge&logo=next.js&logoColor=white" alt="Frontend Repo" /></a>
   <a href="https://ko-fi.com/centmeta"><img src="https://img.shields.io/badge/Support_on-Ko--fi-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" /></a>
 </p>
 
 CentMeta è un'applicazione web indipendente e open-source dedicata all'analisi statistica e al monitoraggio del metagame per il formato Centurion Commander di Magic: The Gathering. 
 
 Questo repository contiene l'infrastruttura di backend, responsabile dell'acquisizione dei dati, dell'elaborazione matematica delle statistiche e della fornitura delle API RESTful al frontend.
+
+> 🔗 **Repository Frontend Correlato**: L'interfaccia utente web, i grafici interattivi e la dashboard analitica in Next.js 14 sono disponibili su [sirfilips/centmeta-frontend](https://github.com/sirfilips/centmeta-frontend).
 
 ## Architettura e Funzionalità Principali
 

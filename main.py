@@ -1608,9 +1608,13 @@ def get_client_ip(request: Request) -> str:
     return "127.0.0.1"
 
 def get_voter_hash(request: Request) -> str:
-    ip = get_client_ip(request)
-    ua = request.headers.get("user-agent", "")
-    payload = f"{COMMUNITY_SALT}:{ip}:{ua}"
+    voter_token = request.headers.get("x-voter-token", "").strip()
+    if voter_token and len(voter_token) >= 16:
+        payload = f"{COMMUNITY_SALT}:token:{voter_token}"
+    else:
+        ip = get_client_ip(request)
+        ua = request.headers.get("user-agent", "")
+        payload = f"{COMMUNITY_SALT}:ip:{ip}:{ua}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 _COMMUNITY_POOL_DATE = ""

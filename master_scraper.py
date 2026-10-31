@@ -50,6 +50,42 @@ def rate_limited_get(url, params=None, timeout=15):
     last_request_time = time.monotonic()
     return session.get(url, params=params, timeout=timeout)
 
+def normalize_partner_commander(cmd_name):
+    """Normalizza e ordina alfabeticamente i nomi dei comandanti Partner (' / ')."""
+    if not cmd_name:
+        return "Sconosciuto"
+    if " / " in cmd_name and " // " not in cmd_name:
+        parts = [p.strip() for p in cmd_name.split(" / ") if p.strip()]
+        parts.sort()
+        return " / ".join(parts)
+    return cmd_name.strip()
+
+def ensure_covering_indices(cursor):
+    """Crea e verifica gli indici covering ottimizzati su decks e deck_cards. Restituisce True se sono stati ricreati."""
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_comandante ON decks(comandante)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_data ON decks(data_aggiornamento)")
+
+    existing_idx = {
+        row[0]: (row[1] or "")
+        for row in cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='deck_cards'"
+        ).fetchall()
+    }
+    needs_analyze = False
+    if "(deck_id, card_name)" not in existing_idx.get("idx_deck_cards_deck_id", ""):
+        cursor.execute("DROP INDEX IF EXISTS idx_deck_cards_deck_id")
+        cursor.execute("CREATE INDEX idx_deck_cards_deck_id ON deck_cards(deck_id, card_name)")
+        needs_analyze = True
+    if "(card_name, deck_id)" not in existing_idx.get("idx_deck_cards_card_name", ""):
+        cursor.execute("DROP INDEX IF EXISTS idx_deck_cards_card_name")
+        cursor.execute("CREATE INDEX idx_deck_cards_card_name ON deck_cards(card_name, deck_id)")
+        needs_analyze = True
+
+    # Pulizia indici duplicati o desueti
+    cursor.execute("DROP INDEX IF EXISTS idx_card_name")
+    cursor.execute("DROP INDEX IF EXISTS idx_comandante")
+    return needs_analyze
+
 def init_db(db_path):
     conn = sqlite3.connect(db_path, timeout=30)
     cursor = conn.cursor()
@@ -72,26 +108,8 @@ def init_db(db_path):
             data_rimozione TEXT
         )
     ''')
-    # Creazione degli indici covering ottimizzati (allineati a main.py)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_comandante ON decks(comandante)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_data ON decks(data_aggiornamento)")
-
-    existing_idx = {
-        row[0]: (row[1] or "")
-        for row in cursor.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='deck_cards'"
-        ).fetchall()
-    }
-    if "(deck_id, card_name)" not in existing_idx.get("idx_deck_cards_deck_id", ""):
-        cursor.execute("DROP INDEX IF EXISTS idx_deck_cards_deck_id")
-        cursor.execute("CREATE INDEX idx_deck_cards_deck_id ON deck_cards(deck_id, card_name)")
-    if "(card_name, deck_id)" not in existing_idx.get("idx_deck_cards_card_name", ""):
-        cursor.execute("DROP INDEX IF EXISTS idx_deck_cards_card_name")
-        cursor.execute("CREATE INDEX idx_deck_cards_card_name ON deck_cards(card_name, deck_id)")
-
-    # Pulizia indici duplicati o desueti
-    cursor.execute("DROP INDEX IF EXISTS idx_card_name")
-    cursor.execute("DROP INDEX IF EXISTS idx_comandante")
+    # Creazione degli indici covering ottimizzati (condivisi con main.py)
+    ensure_covering_indices(cursor)
 
     conn.commit()
     conn.close()
@@ -126,10 +144,7 @@ def scarica_singolo_mazzo(deck_base):
                             comandanti_nomi.append(c_name)
 
                 # Ordina alfabeticamente la lista dei comandanti (per i Partner) prima di unirla
-                if comandanti_nomi:
-                    comandanti_nomi.sort()
-                    
-                comandante_nome = " / ".join(comandanti_nomi) if comandanti_nomi else "Sconosciuto"
+                comandante_nome = normalize_partner_commander(" / ".join(comandanti_nomi)) if comandanti_nomi else "Sconosciuto"
                 data_aggiornamento = deck_dettagliato.get("lastUpdatedAtUtc")
                 carte_unigne_mazzo = set()
                 
@@ -218,11 +233,7 @@ def run_scraper():
                         skipped_blacklist += 1
                         continue
                         
-                    cmd_name = mazzo.get("comandante", "Sconosciuto")
-                    if cmd_name and " / " in cmd_name and " // " not in cmd_name:
-                        parts = [p.strip() for p in cmd_name.split(" / ")]
-                        parts.sort()
-                        cmd_name = " / ".join(parts)
+                    cmd_name = normalize_partner_commander(mazzo.get("comandante", "Sconosciuto"))
                     
                     cursor.execute(
                         "INSERT OR REPLACE INTO decks (id_moxfield, comandante, data_aggiornamento) VALUES (?, ?, ?)",

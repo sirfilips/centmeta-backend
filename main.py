@@ -68,9 +68,7 @@ def sanitize_commanders_in_db():
         for row in rows:
             deck_id = row['id_moxfield']
             commander_name = row['comandante']
-            parts = [part.strip() for part in commander_name.split(' / ')]
-            parts.sort()
-            new_name = " / ".join(parts)
+            new_name = master_scraper.normalize_partner_commander(commander_name)
             
             if new_name != commander_name:
                 c.execute("UPDATE decks SET comandante = ? WHERE id_moxfield = ?", (new_name, deck_id))
@@ -90,24 +88,7 @@ def setup_database_indices():
     conn = get_db()
     c = conn.cursor()
     try:
-        c.execute("CREATE INDEX IF NOT EXISTS idx_decks_comandante ON decks(comandante)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_decks_data ON decks(data_aggiornamento)")
-
-        existing_idx = {
-            row[0]: (row[1] or "")
-            for row in c.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='deck_cards'"
-            ).fetchall()
-        }
-        needs_analyze = False
-        if "(deck_id, card_name)" not in existing_idx.get("idx_deck_cards_deck_id", ""):
-            c.execute("DROP INDEX IF EXISTS idx_deck_cards_deck_id")
-            c.execute("CREATE INDEX idx_deck_cards_deck_id ON deck_cards(deck_id, card_name)")
-            needs_analyze = True
-        if "(card_name, deck_id)" not in existing_idx.get("idx_deck_cards_card_name", ""):
-            c.execute("DROP INDEX IF EXISTS idx_deck_cards_card_name")
-            c.execute("CREATE INDEX idx_deck_cards_card_name ON deck_cards(card_name, deck_id)")
-            needs_analyze = True
+        needs_analyze = master_scraper.ensure_covering_indices(c)
 
         has_stat1 = c.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
@@ -125,14 +106,25 @@ def setup_database_indices():
         conn.close()
 
 _scryfall_lock = threading.RLock()
+_community_lock = threading.RLock()
 _SCRYFALL_COOLDOWN_UNTIL = 0.0
 _SCRYFALL_MISSING_CACHE = set()
 
 def clear_all_caches():
     global _SCRYFALL_CACHE_MEMORY
+    global _COMMUNITY_POOL_DATE, _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL, _COMMUNITY_VALID_CARDS_SET
+    global _DECKS_COUNT_30D_DATE
     with _scryfall_lock:
         _SCRYFALL_CACHE_MEMORY = None
         _SCRYFALL_MISSING_CACHE.clear()
+    with _community_lock:
+        _COMMUNITY_POOL_DATE = ""
+        _COMMUNITY_CORE_100 = []
+        _COMMUNITY_DAILY_50 = []
+        _COMMUNITY_FALLBACK_ALL = []
+        _COMMUNITY_VALID_CARDS_SET = set()
+        _DECKS_COUNT_30D_CACHE.clear()
+        _DECKS_COUNT_30D_DATE = ""
     get_global_commanders_validity.cache_clear()
     get_global_cards_stats.cache_clear()
     get_valid_commanders_set.cache_clear()
@@ -145,27 +137,32 @@ def clear_all_caches():
 def setup_health_db(init_main_blacklist: bool = True):
     if init_main_blacklist:
         conn = get_db()
-        c = conn.cursor()
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS blacklist (
-                id_moxfield TEXT PRIMARY KEY,
-                data_rimozione TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    id_moxfield TEXT PRIMARY KEY,
+                    data_rimozione TEXT
+                )
+            ''')
+            conn.commit()
+        finally:
+            conn.close()
 
     h_conn = get_health_db()
-    h_c = h_conn.cursor()
-    h_c.execute('''
-        CREATE TABLE IF NOT EXISTS health_logs (
-            timestamp TEXT,
-            service TEXT,
-            status TEXT
-        )
-    ''')
-    h_conn.commit()
-    h_conn.close()
+    try:
+        h_conn.execute("PRAGMA journal_mode=WAL;")
+        h_c = h_conn.cursor()
+        h_c.execute('''
+            CREATE TABLE IF NOT EXISTS health_logs (
+                timestamp TEXT,
+                service TEXT,
+                status TEXT
+            )
+        ''')
+        h_conn.commit()
+    finally:
+        h_conn.close()
 
 def setup_community_db():
     conn = get_community_db()
@@ -204,22 +201,9 @@ def setup_community_db():
     finally:
         conn.close()
 
-def _perform_health_pings():
-    setup_health_db(init_main_blacklist=False)
-    now = datetime.now().isoformat()
-    conn = get_health_db()
-    c = conn.cursor()
-    
-    moxfield_ua = os.getenv("MOXFIELD_UA")
-    if moxfield_ua:
-        moxfield_ua = moxfield_ua.strip()
-    
-    # 1. Ping Scryfall
+def _record_service_ping(c, now: str, service: str, request_fn, redact_secret: Optional[str] = None):
     try:
-        res = get_scryfall_session().get(
-            "https://api.scryfall.com/cards/named?exact=Sol Ring",
-            timeout=10
-        )
+        res = request_fn()
         if res.status_code == 200:
             status = "operational"
         elif res.status_code == 429:
@@ -227,52 +211,59 @@ def _perform_health_pings():
         else:
             status = "error"
     except Exception as req_err:
-        logging.warning(f"[HEALTH WARNING] Rilevata anomalia connessione scryfall: {req_err}")
+        err_msg = str(req_err)
+        if redact_secret and redact_secret in err_msg:
+            err_msg = err_msg.replace(redact_secret, "[REDACTED_UA]")
+        logging.warning(f"[HEALTH WARNING] Rilevata anomalia connessione {service}: {err_msg}")
         status = "down"
-        
-    c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, "scryfall", status))
+
+    c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, service, status))
     c.execute("""
         DELETE FROM health_logs 
         WHERE service=? AND rowid NOT IN (
             SELECT rowid FROM health_logs 
             WHERE service=? ORDER BY timestamp DESC LIMIT 48
         )
-    """, ("scryfall", "scryfall"))
-    
-    # 2. Ping Moxfield
-    if not moxfield_ua:
-        logging.warning("[HEALTH WARNING] Variabile MOXFIELD_UA non impostata. Salto il ping a Moxfield.")
-    else:
-        try:
-            res = requests.get(
-                "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
-                headers={"User-Agent": moxfield_ua},
-                timeout=10
+    """, (service, service))
+
+def _perform_health_pings():
+    setup_health_db(init_main_blacklist=False)
+    now = datetime.now().isoformat()
+    conn = get_health_db()
+    try:
+        c = conn.cursor()
+        
+        moxfield_ua = os.getenv("MOXFIELD_UA")
+        if moxfield_ua:
+            moxfield_ua = moxfield_ua.strip()
+        
+        # 1. Ping Scryfall
+        _record_service_ping(
+            c,
+            now,
+            "scryfall",
+            lambda: get_scryfall_session().get("https://api.scryfall.com/cards/named?exact=Sol Ring", timeout=10)
+        )
+        
+        # 2. Ping Moxfield
+        if not moxfield_ua:
+            logging.warning("[HEALTH WARNING] Variabile MOXFIELD_UA non impostata. Salto il ping a Moxfield.")
+        else:
+            _record_service_ping(
+                c,
+                now,
+                "moxfield",
+                lambda: requests.get(
+                    "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
+                    headers={"User-Agent": moxfield_ua},
+                    timeout=10
+                ),
+                redact_secret=moxfield_ua
             )
-            if res.status_code == 200:
-                status = "operational"
-            elif res.status_code == 429:
-                status = "rate_limited"
-            else:
-                status = "error"
-        except Exception as req_err:
-            err_msg = str(req_err)
-            if moxfield_ua and moxfield_ua in err_msg:
-                err_msg = err_msg.replace(moxfield_ua, "[REDACTED_UA]")
-            logging.warning(f"[HEALTH WARNING] Rilevata anomalia connessione moxfield: {err_msg}")
-            status = "down"
-            
-        c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, "moxfield", status))
-        c.execute("""
-            DELETE FROM health_logs 
-            WHERE service=? AND rowid NOT IN (
-                SELECT rowid FROM health_logs 
-                WHERE service=? ORDER BY timestamp DESC LIMIT 48
-            )
-        """, ("moxfield", "moxfield"))
-    
-    conn.commit()
-    conn.close()
+        
+        conn.commit()
+    finally:
+        conn.close()
     print(f"[HEALTH] Ping orario completato alle {now}")
 
 async def background_health_pinger():
@@ -336,7 +327,9 @@ DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
 HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db")
 COMMUNITY_DB_PATH = os.path.join(CARTELLA_SCRIPT, "community.db")
 CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
-COMMUNITY_SALT = os.getenv("COMMUNITY_SALT", "centmeta_community_salt_secret_2026")
+COMMUNITY_SALT = os.getenv("COMMUNITY_SALT") or "centmeta_community_salt_secret_2026"
+if not os.getenv("COMMUNITY_SALT"):
+    logging.warning("[SECURITY] Variabile d'ambiente COMMUNITY_SALT non impostata: in uso il fallback predefinito per compatibilità coi voti esistenti.")
 
 _SCRYFALL_CACHE_MEMORY = None
 
@@ -550,9 +543,8 @@ def fetch_scryfall_data(card_names):
                 continue
             mancanti.append(n)
 
-    if cache_updated_locally and not mancanti:
-        save_scryfall_cache(results)
-            
+    any_updated = cache_updated_locally
+
     if mancanti:
         session = get_scryfall_session()
         weird_sets = {"sta", "otp", "wot", "mul", "brr", "sld", "mps", "mp2", "exp", "mb1", "plist", "h1r", "slx"}
@@ -563,8 +555,6 @@ def fetch_scryfall_data(card_names):
                 
             chunk = mancanti[i:i+75]
             identifiers = [{"name": n} for n in chunk]
-            updated_in_chunk = cache_updated_locally
-            cache_updated_locally = False
             
             try:
                 res = session.post(
@@ -636,7 +626,7 @@ def fetch_scryfall_data(card_names):
                                 if req_k not in results and req_k.replace(" ", "").replace("-", "") == norm_target:
                                     results[req_k] = card_data
 
-                        updated_in_chunk = True
+                        any_updated = True
 
                     for nf in body.get("not_found", []):
                         nf_name = nf.get("name")
@@ -648,7 +638,7 @@ def fetch_scryfall_data(card_names):
                         if nf_key.startswith("a-") and _is_valid_cached_card(results.get(nf_key[2:])):
                             with _scryfall_lock:
                                 results[nf_key] = results[nf_key[2:]]
-                            updated_in_chunk = True
+                            any_updated = True
                             continue
 
                         # Fallback con /cards/named per carte Split/DFC non risolte da /cards/collection (es. "Armed // Dangerous")
@@ -674,7 +664,7 @@ def fetch_scryfall_data(card_names):
                                                 fk = f_part.lower()
                                                 if not _is_valid_cached_card(results.get(fk)) or " // " in results[fk].get("full_name", " // "):
                                                     results[fk] = card_data
-                                        updated_in_chunk = True
+                                        any_updated = True
                                         resolved_via_named = True
                             except Exception as e:
                                 logging.warning(f"Errore fallback Scryfall named per {nf_name}: {e}")
@@ -685,9 +675,9 @@ def fetch_scryfall_data(card_names):
                                 
             except Exception as e:
                 logging.warning(f"Errore API Scryfall collection: {e}")
-            
-            if updated_in_chunk:
-                save_scryfall_cache(results)
+
+    if any_updated:
+        save_scryfall_cache(results)
                     
     return results
 
@@ -852,7 +842,7 @@ def get_valid_commanders_set(filtro_tempo: str):
         curr_params.extend(invalid_cmds)
 
     base_where = f"WHERE {' AND '.join(curr_conds)}" if curr_conds else ""
-    q_curr = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC"
+    q_curr = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
     curr_rows = c.execute(q_curr, curr_params).fetchall()
     
     if prev_cond:
@@ -862,7 +852,7 @@ def get_valid_commanders_set(filtro_tempo: str):
             placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
             prev_conds.append(f"comandante NOT IN {placeholders}")
             prev_params.extend(invalid_cmds)
-        q_prev = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {' AND '.join(prev_conds)} GROUP BY comandante ORDER BY cnt DESC"
+        q_prev = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {' AND '.join(prev_conds)} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
         prev_rows = c.execute(q_prev, prev_params).fetchall()
         prev_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_rows)}
         
@@ -938,19 +928,19 @@ def get_dashboard_data_cached(filtro_tempo: str):
     base_where = build_where(curr_cond, False)
     tot_decks = c.execute(f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {base_where}", inv_params).fetchone()['tot']
 
-    q_curr_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC"
+    q_curr_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
     curr_cmd_rows = c.execute(q_curr_cmd, inv_params).fetchall()
     
     if prev_cond:
         prev_where = build_where(prev_cond, False)
-        q_prev_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {prev_where} GROUP BY comandante ORDER BY cnt DESC"
+        q_prev_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {prev_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
         prev_cmd_rows = c.execute(q_prev_cmd, inv_params).fetchall()
         prev_cmd_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_cmd_rows)}
         
         df_top_cmd = []
         for idx, r in enumerate(curr_cmd_rows[:25]):
             cmd = r['comandante']
-            trend = prev_cmd_ranks.get(cmd, idx + 1) - (idx + 1) if cmd in prev_cmd_ranks else None
+            trend = prev_cmd_ranks[cmd] - (idx + 1) if cmd in prev_cmd_ranks else None
             df_top_cmd.append({'comandante': cmd, 'cnt': r['cnt'], 'trend': trend})
     else:
         df_top_cmd = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_cmd_rows[:25]]
@@ -970,7 +960,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
         if cnt1 >= 2 and delta > 0:
             df_hot_cmd.append({'comandante': cmd, 'cnt1': cnt1, 'delta': delta})
             
-    df_hot_cmd.sort(key=lambda x: x['delta'], reverse=True)
+    df_hot_cmd.sort(key=lambda x: (-x['delta'], -x['cnt1'], x['comandante']))
     df_hot_cmd = df_hot_cmd[:50]
 
     where_curr = build_where(curr_cond, True)
@@ -980,7 +970,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
         SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
         FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
         {where_curr}
-        GROUP BY c.card_name ORDER BY freq DESC
+        GROUP BY c.card_name ORDER BY freq DESC, c.card_name ASC
     """
     curr_card_rows = c.execute(q_curr_cards, inv_params).fetchall()
     
@@ -989,7 +979,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
             SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
             FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
             {where_prev}
-            GROUP BY c.card_name ORDER BY freq DESC
+            GROUP BY c.card_name ORDER BY freq DESC, c.card_name ASC
         """
         prev_card_rows = c.execute(q_prev_cards, inv_params).fetchall()
         prev_card_ranks = {r['card_name']: idx + 1 for idx, r in enumerate(prev_card_rows)}
@@ -997,7 +987,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
         df_top_cards = []
         for idx, r in enumerate(curr_card_rows[:250]):
             c_name = r['card_name']
-            trend = prev_card_ranks.get(c_name, idx + 1) - (idx + 1) if c_name in prev_card_ranks else None
+            trend = prev_card_ranks[c_name] - (idx + 1) if c_name in prev_card_ranks else None
             df_top_cards.append({'card_name': c_name, 'freq': r['freq'], 'trend': trend})
     else:
         df_top_cards = [{'card_name': r['card_name'], 'freq': r['freq'], 'trend': ""} for r in curr_card_rows[:250]]
@@ -1027,7 +1017,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
         if cnt1 >= 3 and delta > 0:
             df_hot_c.append({'card_name': c_name, 'cnt1': cnt1, 'delta': delta})
             
-    df_hot_c.sort(key=lambda x: x['delta'], reverse=True)
+    df_hot_c.sort(key=lambda x: (-x['delta'], -x['cnt1'], x['card_name']))
     df_hot_c = df_hot_c[:250]
         
     conn.close()
@@ -1127,33 +1117,15 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
         conn.close()
         return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
         
-    c.execute("PRAGMA table_info(deck_cards)")
-    columns = [info[1].lower() for info in c.fetchall()]
-    
-    qty_col = None
-    for col in ['qty', 'quantita', 'quantity', 'copies', 'copie']:
-        if col in columns:
-            qty_col = col
-            break
-            
     where_clause_join = where_clause.replace("comandante", "d.comandante").replace("data_aggiornamento", "d.data_aggiornamento")
     
-    if qty_col:
-        q_cards = f"""
-            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq, SUM(c.{qty_col}) as total_copies 
-            FROM deck_cards c
-            JOIN decks d ON c.deck_id = d.id_moxfield
-            {where_clause_join}
-            GROUP BY c.card_name
-        """
-    else:
-        q_cards = f"""
-            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq
-            FROM deck_cards c
-            JOIN decks d ON c.deck_id = d.id_moxfield
-            {where_clause_join}
-            GROUP BY c.card_name
-        """
+    q_cards = f"""
+        SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq
+        FROM deck_cards c
+        JOIN decks d ON c.deck_id = d.id_moxfield
+        {where_clause_join}
+        GROUP BY c.card_name
+    """
         
     stats_rows = c.execute(q_cards, params).fetchall()
     conn.close()
@@ -1162,7 +1134,6 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
     for row in stats_rows:
         c_name = row['card_name']
         freq = row['freq']
-        total_copies = row['total_copies'] if qty_col else None
         
         perc = round((freq / total_decks) * 100, 1)
         g_freq = global_cards.get(c_name, 0)
@@ -1172,12 +1143,11 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
         stats_list.append({
             'card_name': c_name,
             'freq': freq,
-            'total_copies': total_copies,
             'Percentuale': perc,
             'Sinergia': sinergia
         })
         
-    stats_list.sort(key=lambda x: (x['Percentuale'], x['freq']), reverse=True)
+    stats_list.sort(key=lambda x: (-x['Percentuale'], -x['freq'], x['card_name']))
     
     scryfall_cache = fetch_scryfall_data([x['card_name'] for x in stats_list])
     
@@ -1195,11 +1165,8 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
             
         cat = categorizza_tipo(info.get("type", ""))
         
-        if row['total_copies'] is not None:
-            avg_copies_comp = float(row['total_copies']) / total_decks
-        else:
-            avg_copies_comp = float(row['freq']) / total_decks
-            somma_univoche += avg_copies_comp
+        avg_copies_comp = float(row['freq']) / total_decks
+        somma_univoche += avg_copies_comp
         
         if cat in type_dist:
             type_dist[cat] += avg_copies_comp
@@ -1223,12 +1190,11 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
             "category": cat
         })
         
-    if not qty_col:
-        is_partner_cmd = bool(comandante and " / " in comandante and " // " not in comandante)
-        expected_mainboard = 98.0 if is_partner_cmd else 99.0
-        terre_mancanti = expected_mainboard - somma_univoche
-        if terre_mancanti > 0:
-            type_dist["Terre"] += terre_mancanti
+    is_partner_cmd = bool(comandante and " / " in comandante and " // " not in comandante)
+    expected_mainboard = 98.0 if is_partner_cmd else 99.0
+    terre_mancanti = expected_mainboard - somma_univoche
+    if terre_mancanti > 0:
+        type_dist["Terre"] += terre_mancanti
             
     return {
         "total_decks": total_decks,
@@ -1241,12 +1207,15 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
 @lru_cache(maxsize=512)
 def get_card_details_cached(card_name: str, filtro_tempo: str):
     valid_all, invalid_cmds = get_global_commanders_validity()
+    _, global_cards = get_global_cards_stats()
+    total_decks_global = global_cards.get(card_name, 0)
+
     scryfall_cache = load_scryfall_cache()
-    if not lookup_card_info(scryfall_cache, card_name):
+    if total_decks_global > 0 and not lookup_card_info(scryfall_cache, card_name):
         scryfall_cache = fetch_scryfall_data([card_name])
     card_info_cache = lookup_card_info(scryfall_cache, card_name)
 
-    if not valid_all:
+    if not valid_all or total_decks_global == 0:
         return {
             "card_name": card_name,
             "images": card_info_cache.get("images", []),
@@ -1274,24 +1243,11 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
     if t_cond:
         time_filtered_cond = " AND " + t_cond.replace("data_aggiornamento", "d.data_aggiornamento")
 
-    q_tot_glob = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}"
-    total_decks_global = c.execute(q_tot_glob, [card_name] + inv_params).fetchone()['tot']
-    
-    if total_decks_global == 0:
-        conn.close()
-        return {
-            "card_name": card_name,
-            "images": card_info_cache.get("images", []),
-            "art_crops": card_info_cache.get("art_crops", []),
-            "oracles": card_info_cache.get("oracles", []),
-            "total_decks_with_card": 0,
-            "total_decks_global": 0,
-            "commanders": [],
-            "synergies": []
-        }
-    
-    q_tot_time = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond}"
-    total_decks_time = c.execute(q_tot_time, [card_name] + inv_params).fetchone()['tot']
+    if not t_cond:
+        total_decks_time = total_decks_global
+    else:
+        q_tot_time = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond}"
+        total_decks_time = c.execute(q_tot_time, [card_name] + inv_params).fetchone()['tot']
 
     if total_decks_time == 0:
         conn.close()
@@ -1329,7 +1285,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
             'totale_comandante': totale,
             'Percentuale': perc
         })
-    res_cmd.sort(key=lambda x: (x['Percentuale'], x['mazzi_carta']), reverse=True)
+    res_cmd.sort(key=lambda x: (-x['Percentuale'], -x['mazzi_carta'], x['comandante']))
     
     all_cmd_names = [x['comandante'] for x in res_cmd]
     scryfall_cache = fetch_scryfall_data(all_cmd_names + [card_name])
@@ -1373,7 +1329,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
             'freq': freq,
             'Percentuale': perc
         })
-    syn_df.sort(key=lambda x: (x['Percentuale'], x['freq']), reverse=True)
+    syn_df.sort(key=lambda x: (-x['Percentuale'], -x['freq'], x['card_name']))
     syn_df = syn_df[:50]
     
     syn_cache = fetch_scryfall_data([x['card_name'] for x in syn_df])
@@ -1471,10 +1427,40 @@ async def get_decks_stats(filtro_tempo: str = "Tutti i tempi", comandante: Optio
         
     return data
 
+def _get_card_details_safe(card_name: str, filtro_tempo: str):
+    card_name = (card_name or "").strip()[:150]
+    if not card_name:
+        return {
+            "card_name": "",
+            "images": [],
+            "art_crops": [],
+            "oracles": [],
+            "total_decks_with_card": 0,
+            "total_decks_global": 0,
+            "commanders": [],
+            "synergies": []
+        }
+    _, global_cards = get_global_cards_stats()
+    if card_name not in global_cards:
+        # Non inquinare @lru_cache e non effettuare chiamate esterne a Scryfall per carte inesistenti nel DB
+        scryfall_cache = load_scryfall_cache()
+        card_info_cache = lookup_card_info(scryfall_cache, card_name)
+        return {
+            "card_name": card_name,
+            "images": card_info_cache.get("images", []),
+            "art_crops": card_info_cache.get("art_crops", []),
+            "oracles": card_info_cache.get("oracles", []),
+            "total_decks_with_card": 0,
+            "total_decks_global": 0,
+            "commanders": [],
+            "synergies": []
+        }
+    return get_card_details_cached(card_name, filtro_tempo)
+
 @app.get("/api/card/details")
 async def get_card_details(card_name: str, filtro_tempo: str = "Tutti i tempi"):
     filtro_tempo = normalize_period(filtro_tempo)
-    return await run_in_threadpool(get_card_details_cached, card_name, filtro_tempo)
+    return await run_in_threadpool(_get_card_details_safe, card_name, filtro_tempo)
 
 @app.get("/api/commander/decks")
 async def get_commander_decks(comandante: str, filtro_tempo: str = "Tutti i tempi", limit: int = 0, offset: int = 0):
@@ -1558,7 +1544,7 @@ async def remove_deck(
 BASIC_LANDS = {
     "plains", "island", "swamp", "mountain", "forest", "wastes",
     "snow-covered plains", "snow-covered island", "snow-covered swamp",
-    "snow-covered mountain", "snow-covered forest"
+    "snow-covered mountain", "snow-covered forest", "snow-covered wastes"
 }
 
 def is_land_card(card_name: str, scryfall_cache: Optional[dict] = None) -> bool:
@@ -1607,96 +1593,166 @@ def get_client_ip(request: Request) -> str:
         return request.client.host
     return "127.0.0.1"
 
+_VOTER_TOKEN_RE = re.compile(r"^[a-zA-Z0-9_-]{16,64}$")
+_VOTE_RATE_LIMIT_LOCK = threading.Lock()
+_IP_VOTE_TIMESTAMPS: dict[str, list[float]] = {}
+_IP_VOTER_HASHES: dict[str, dict[str, float]] = {}
+
 def get_voter_hash(request: Request) -> str:
     voter_token = request.headers.get("x-voter-token", "").strip()
-    if voter_token and len(voter_token) >= 16:
+    if voter_token and _VOTER_TOKEN_RE.match(voter_token):
         payload = f"{COMMUNITY_SALT}:token:{voter_token}"
     else:
         ip = get_client_ip(request)
-        ua = request.headers.get("user-agent", "")
+        ua = request.headers.get("user-agent", "")[:256]
         payload = f"{COMMUNITY_SALT}:ip:{ip}:{ua}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def _check_vote_rate_limit(request: Request, voter_hash: str):
+    ip = get_client_ip(request)
+    now_ts = std_time.time()
+    with _VOTE_RATE_LIMIT_LOCK:
+        if len(_IP_VOTE_TIMESTAMPS) > 2000:
+            cutoff_min = now_ts - 60.0
+            for k in list(_IP_VOTE_TIMESTAMPS.keys()):
+                _IP_VOTE_TIMESTAMPS[k] = [t for t in _IP_VOTE_TIMESTAMPS[k] if t > cutoff_min]
+                if not _IP_VOTE_TIMESTAMPS[k]:
+                    del _IP_VOTE_TIMESTAMPS[k]
+        if len(_IP_VOTER_HASHES) > 2000:
+            cutoff_hr = now_ts - 3600.0
+            for k in list(_IP_VOTER_HASHES.keys()):
+                _IP_VOTER_HASHES[k] = {vh: t for vh, t in _IP_VOTER_HASHES[k].items() if t > cutoff_hr}
+                if not _IP_VOTER_HASHES[k]:
+                    del _IP_VOTER_HASHES[k]
+
+        recent_votes = [t for t in _IP_VOTE_TIMESTAMPS.get(ip, []) if now_ts - t < 60.0]
+        if len(recent_votes) >= 60:
+            raise HTTPException(status_code=429, detail="Troppi voti ravvicinati. Riprova tra qualche secondo.")
+
+        ip_hashes = {vh: t for vh, t in _IP_VOTER_HASHES.get(ip, {}).items() if now_ts - t < 3600.0}
+        if voter_hash not in ip_hashes and len(ip_hashes) >= 5:
+            raise HTTPException(status_code=429, detail="Limite di sessioni di voto per questo indirizzo IP raggiunto.")
+
+        recent_votes.append(now_ts)
+        _IP_VOTE_TIMESTAMPS[ip] = recent_votes
+        ip_hashes[voter_hash] = now_ts
+        _IP_VOTER_HASHES[ip] = ip_hashes
 
 _COMMUNITY_POOL_DATE = ""
 _COMMUNITY_CORE_100 = []
 _COMMUNITY_DAILY_50 = []
 _COMMUNITY_FALLBACK_ALL = []
+_COMMUNITY_VALID_CARDS_SET: set[str] = set()
 _DECKS_COUNT_30D_CACHE = {}
 _DECKS_COUNT_30D_DATE = ""
 
 def get_card_30d_decks_count(card_name: str) -> int:
     global _DECKS_COUNT_30D_CACHE, _DECKS_COUNT_30D_DATE
     today_str = datetime.now().strftime("%Y-%m-%d")
-    if _DECKS_COUNT_30D_DATE != today_str:
-        _DECKS_COUNT_30D_CACHE.clear()
-        _DECKS_COUNT_30D_DATE = today_str
+    with _community_lock:
+        if _DECKS_COUNT_30D_DATE != today_str:
+            _DECKS_COUNT_30D_CACHE.clear()
+            _DECKS_COUNT_30D_DATE = today_str
 
-    if card_name in _DECKS_COUNT_30D_CACHE:
-        return _DECKS_COUNT_30D_CACHE[card_name]
+        if card_name in _DECKS_COUNT_30D_CACHE:
+            return _DECKS_COUNT_30D_CACHE[card_name]
 
+    _, invalid_cmds = get_global_commanders_validity()
     conn = get_db()
     c = conn.cursor()
     try:
-        date_limit_30d = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        cnt = c.execute("""
+        inv_clause = ""
+        params = [card_name]
+        if invalid_cmds:
+            placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+            inv_clause = f" AND d.comandante NOT IN {placeholders}"
+            params.extend(invalid_cmds)
+
+        cnt = c.execute(f"""
             SELECT COUNT(DISTINCT d.id_moxfield) as cnt 
             FROM deck_cards dc
             JOIN decks d ON dc.deck_id = d.id_moxfield
-            WHERE dc.card_name = ? AND d.data_aggiornamento >= ?
-        """, (card_name, date_limit_30d)).fetchone()['cnt']
-        _DECKS_COUNT_30D_CACHE[card_name] = cnt
+            WHERE dc.card_name = ? AND d.data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-30 days'){inv_clause}
+        """, params).fetchone()['cnt']
+        with _community_lock:
+            _DECKS_COUNT_30D_CACHE[card_name] = cnt
         return cnt
     finally:
         conn.close()
 
 def get_community_card_pools():
-    global _COMMUNITY_POOL_DATE, _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
+    global _COMMUNITY_POOL_DATE, _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL, _COMMUNITY_VALID_CARDS_SET
     today_str = datetime.now().strftime("%Y-%m-%d")
-    if _COMMUNITY_POOL_DATE == today_str and _COMMUNITY_CORE_100 and _COMMUNITY_DAILY_50:
-        return _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
+    with _community_lock:
+        if _COMMUNITY_POOL_DATE == today_str and _COMMUNITY_CORE_100 and _COMMUNITY_DAILY_50:
+            return _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
 
-    conn = get_db()
-    c = conn.cursor()
-    try:
-        # Peschiamo le carte dai mazzi aggiornati negli ultimi 60 giorni, ordinate per diffusione
-        date_limit = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
-        rows = c.execute("""
-            SELECT dc.card_name, COUNT(DISTINCT d.id_moxfield) as cnt
-            FROM deck_cards dc
-            JOIN decks d ON dc.deck_id = d.id_moxfield
-            WHERE d.data_aggiornamento >= ?
-            GROUP BY dc.card_name
-            ORDER BY cnt DESC
-        """, (date_limit,)).fetchall()
+        _, invalid_cmds = get_global_commanders_validity()
+        conn = get_db()
+        c = conn.cursor()
+        try:
+            inv_clause = ""
+            params = []
+            if invalid_cmds:
+                placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+                inv_clause = f" AND d.comandante NOT IN {placeholders}"
+                params.extend(invalid_cmds)
 
-        scryfall_cache = load_scryfall_cache()
-        filtered_cards = [r['card_name'] for r in rows if not is_land_card(r['card_name'], scryfall_cache)]
+            # Peschiamo le carte dai mazzi aggiornati negli ultimi 60 giorni, ordinate per diffusione
+            rows = c.execute(f"""
+                SELECT dc.card_name, COUNT(DISTINCT d.id_moxfield) as cnt
+                FROM deck_cards dc
+                JOIN decks d ON dc.deck_id = d.id_moxfield
+                WHERE d.data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 days'){inv_clause}
+                GROUP BY dc.card_name
+                ORDER BY cnt DESC, dc.card_name ASC
+            """, params).fetchall()
 
-        # Top 100 fisse (le colonne portanti del meta)
-        core_100 = filtered_cards[:100]
+            scryfall_cache = load_scryfall_cache()
+            filtered_cards = [r['card_name'] for r in rows if not is_land_card(r['card_name'], scryfall_cache)]
 
-        # 50 carte a rotazione giornaliera pescate deterministicamente tra le posizioni 101 e 600
-        rotation_candidates = filtered_cards[100:600]
-        if not rotation_candidates:
-            rotation_candidates = filtered_cards[100:]
+            # Top 100 fisse (le colonne portanti del meta)
+            core_100 = filtered_cards[:100]
 
-        rng = random.Random(f"centmeta-daily-{today_str}")
-        if len(rotation_candidates) >= 50:
-            daily_50 = rng.sample(rotation_candidates, 50)
-        else:
-            daily_50 = rotation_candidates
+            # 50 carte a rotazione giornaliera pescate deterministicamente tra le posizioni 101 e 600
+            rotation_candidates = filtered_cards[100:600]
+            if not rotation_candidates:
+                rotation_candidates = filtered_cards[100:]
 
-        # Fallback completo (tutte le carte non base del catalogo) per utenti che completano il pool
-        rows_all = c.execute("SELECT DISTINCT card_name FROM deck_cards").fetchall()
-        fallback_all = [r['card_name'] for r in rows_all if not is_land_card(r['card_name'], scryfall_cache)]
+            rng = random.Random(f"centmeta-daily-{today_str}")
+            if len(rotation_candidates) >= 50:
+                daily_50 = rng.sample(rotation_candidates, 50)
+            else:
+                daily_50 = rotation_candidates
 
-        _COMMUNITY_POOL_DATE = today_str
-        _COMMUNITY_CORE_100 = core_100
-        _COMMUNITY_DAILY_50 = daily_50
-        _COMMUNITY_FALLBACK_ALL = fallback_all
-        return _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
-    finally:
-        conn.close()
+            # Fallback completo (tutte le carte non terra del catalogo di mazzi validi)
+            if invalid_cmds:
+                placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+                rows_all = c.execute(f"""
+                    SELECT DISTINCT dc.card_name
+                    FROM deck_cards dc
+                    JOIN decks d ON dc.deck_id = d.id_moxfield
+                    WHERE d.comandante NOT IN {placeholders}
+                """, list(invalid_cmds)).fetchall()
+            else:
+                rows_all = c.execute("SELECT DISTINCT card_name FROM deck_cards").fetchall()
+            fallback_all = [r['card_name'] for r in rows_all if not is_land_card(r['card_name'], scryfall_cache)]
+
+            _COMMUNITY_POOL_DATE = today_str
+            _COMMUNITY_CORE_100 = core_100
+            _COMMUNITY_DAILY_50 = daily_50
+            _COMMUNITY_FALLBACK_ALL = fallback_all
+            _COMMUNITY_VALID_CARDS_SET = set(fallback_all) | set(filtered_cards)
+            return _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL
+        finally:
+            conn.close()
+
+def _build_daily_progress(today_active_set: set[str], voted_set: set[str]) -> dict:
+    return {
+        "voted_today": len(today_active_set.intersection(voted_set)),
+        "pool_size": len(today_active_set),
+        "total_voted": len(voted_set)
+    }
 
 def get_random_community_card(voter_hash: str):
     core_100, daily_50, fallback_all = get_community_card_pools()
@@ -1707,7 +1763,6 @@ def get_random_community_card(voter_hash: str):
     if not today_active_pool:
         raise HTTPException(status_code=404, detail="Nessuna carta disponibile nel database")
 
-    # Ottieni le carte già votate da questo utente e quelle in fase di consolidamento (1-4 voti totali)
     comm_conn = get_community_db()
     c_comm = comm_conn.cursor()
     try:
@@ -1719,25 +1774,34 @@ def get_random_community_card(voter_hash: str):
             WHERE total_votes >= 1 AND total_votes < 5
         """).fetchall()
         partial_votes_set = {r['card_name'] for r in partial_rows}
+
+        # Filtra le carte non ancora votate da questo utente tra le 150 attive oggi
+        unvoted_pool = [card for card in today_active_pool if card not in voted_set]
+
+        # Se l'utente ha già votato tutte le 150 del giorno, pesca dal catalogo generale
+        if not unvoted_pool:
+            unvoted_pool = [card for card in fallback_all if card not in voted_set]
+            if not unvoted_pool:
+                # Ha votato tutte le carte esistenti: ricomincia dal pool di oggi
+                unvoted_pool = today_active_pool
+
+        # CACCIA AL QUORUM: 65% di probabilità di proporre una carta che ha già 1-4 voti per portarla a 5
+        quorum_candidates = [card for card in unvoted_pool if card in partial_votes_set]
+        if quorum_candidates and random.random() < 0.65:
+            chosen_card = random.choice(quorum_candidates)
+        else:
+            chosen_card = random.choice(unvoted_pool)
+
+        r_row = c_comm.execute("""
+            SELECT total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5
+            FROM community_ratings WHERE card_name = ?
+        """, (chosen_card,)).fetchone()
+
+        user_vote_row = c_comm.execute("""
+            SELECT score FROM community_votes WHERE voter_hash = ? AND card_name = ?
+        """, (voter_hash, chosen_card)).fetchone()
     finally:
         comm_conn.close()
-
-    # Filtra le carte non ancora votate da questo utente tra le 150 attive oggi
-    unvoted_pool = [card for card in today_active_pool if card not in voted_set]
-
-    # Se l'utente ha già votato tutte le 150 del giorno, pesca dal catalogo generale
-    if not unvoted_pool:
-        unvoted_pool = [card for card in fallback_all if card not in voted_set]
-        if not unvoted_pool:
-            # Ha votato tutte le carte esistenti: ricomincia dal pool di oggi
-            unvoted_pool = today_active_pool
-
-    # CACCIA AL QUORUM: 65% di probabilità di proporre una carta che ha già 1-4 voti per portarla a 5
-    quorum_candidates = [card for card in unvoted_pool if card in partial_votes_set]
-    if quorum_candidates and random.random() < 0.65:
-        chosen_card = random.choice(quorum_candidates)
-    else:
-        chosen_card = random.choice(unvoted_pool)
 
     # Identificazione tipologia carta nel pool odierno
     is_core_staple = chosen_card in core_100
@@ -1753,21 +1817,6 @@ def get_random_community_card(voter_hash: str):
     # Calcola il numero di mazzi negli ultimi 30 giorni in cui compare la carta (in-memory cache)
     decks_count = get_card_30d_decks_count(chosen_card)
 
-    # Statistiche di valutazione attuali per questa carta
-    comm_conn = get_community_db()
-    c_comm = comm_conn.cursor()
-    try:
-        r_row = c_comm.execute("""
-            SELECT total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5
-            FROM community_ratings WHERE card_name = ?
-        """, (chosen_card,)).fetchone()
-
-        user_vote_row = c_comm.execute("""
-            SELECT score FROM community_votes WHERE voter_hash = ? AND card_name = ?
-        """, (voter_hash, chosen_card)).fetchone()
-    finally:
-        comm_conn.close()
-
     community_stats = {
         "total_votes": r_row['total_votes'] if r_row else 0,
         "avg_score": r_row['avg_score'] if r_row else 0.0,
@@ -1782,8 +1831,6 @@ def get_random_community_card(voter_hash: str):
     }
 
     today_active_set = set(today_active_pool)
-    voted_today_count = len(today_active_set.intersection(voted_set))
-    pool_size = len(today_active_pool)
 
     return {
         "card_name": chosen_card,
@@ -1798,11 +1845,7 @@ def get_random_community_card(voter_hash: str):
         "is_daily_spotlight": is_daily_spotlight,
         "is_recent_pool": is_core_staple or is_daily_spotlight,
         "community_stats": community_stats,
-        "daily_progress": {
-            "voted_today": voted_today_count,
-            "pool_size": pool_size,
-            "total_voted": len(voted_set)
-        }
+        "daily_progress": _build_daily_progress(today_active_set, voted_set)
     }
 
 class VotePayload(BaseModel):
@@ -1810,6 +1853,11 @@ class VotePayload(BaseModel):
     score: int = Field(..., ge=1, le=5)
 
 def record_community_vote(card_name: str, score: int, voter_hash: str):
+    card_name = (card_name or "").strip()
+    core_100, daily_50, _ = get_community_card_pools()
+    if not card_name or card_name not in _COMMUNITY_VALID_CARDS_SET or is_land_card(card_name):
+        raise HTTPException(status_code=400, detail="Carta non valida o non votabile")
+
     comm_conn = get_community_db()
     c = comm_conn.cursor()
     now = datetime.now().isoformat()
@@ -1865,12 +1913,9 @@ def record_community_vote(card_name: str, score: int, voter_hash: str):
             FROM community_ratings WHERE card_name = ?
         """, (card_name,)).fetchone()
 
-        core_100, daily_50, _ = get_community_card_pools()
         today_active_set = set(core_100 + daily_50)
         voted_rows = c.execute("SELECT card_name FROM community_votes WHERE voter_hash = ?", (voter_hash,)).fetchall()
         all_voted_set = {r['card_name'] for r in voted_rows}
-        voted_today_count = len(today_active_set.intersection(all_voted_set))
-        pool_size = len(today_active_set)
 
         return {
             "status": "success",
@@ -1885,39 +1930,83 @@ def record_community_vote(card_name: str, score: int, voter_hash: str):
                 4: updated['stars_4'] if updated else 0,
                 5: updated['stars_5'] if updated else 0
             },
-            "daily_progress": {
-                "voted_today": voted_today_count,
-                "pool_size": pool_size,
-                "total_voted": len(all_voted_set)
-            }
+            "daily_progress": _build_daily_progress(today_active_set, all_voted_set)
         }
     finally:
         comm_conn.close()
 
-def get_community_leaderboard(sort: str = "highest", min_votes: int = 2, limit: int = 50, offset: int = 0):
+def get_community_leaderboard(
+    sort: str = "highest",
+    min_votes: int = 2,
+    limit: int = 50,
+    offset: int = 0,
+    search: str = "",
+    colors: str = ""
+):
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
     min_votes = max(1, min_votes)
+    search_clean = (search or "").strip().lower()
+    active_colors = [col.strip().upper() for col in (colors or "").split(",") if col.strip()]
 
-    order_clause = "ORDER BY avg_score DESC, total_votes DESC"
+    order_clause = "ORDER BY avg_score DESC, total_votes DESC, card_name ASC"
     if sort == "most_voted":
-        order_clause = "ORDER BY total_votes DESC, avg_score DESC"
+        order_clause = "ORDER BY total_votes DESC, avg_score DESC, card_name ASC"
     elif sort == "lowest":
-        order_clause = "ORDER BY avg_score ASC, total_votes DESC"
+        order_clause = "ORDER BY avg_score ASC, total_votes DESC, card_name ASC"
 
     comm_conn = get_community_db()
     c = comm_conn.cursor()
     try:
-        total_count = c.execute("SELECT COUNT(*) as cnt FROM community_ratings WHERE total_votes >= ?", (min_votes,)).fetchone()['cnt']
-        
-        query = f"""
-            SELECT card_name, total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5, last_voted_at
-            FROM community_ratings
-            WHERE total_votes >= ?
-            {order_clause}
-            LIMIT ? OFFSET ?
-        """
-        rows = c.execute(query, (min_votes, limit, offset)).fetchall()
+        if not search_clean and not active_colors:
+            total_count = c.execute("SELECT COUNT(*) as cnt FROM community_ratings WHERE total_votes >= ?", (min_votes,)).fetchone()['cnt']
+            query = f"""
+                SELECT card_name, total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5, last_voted_at
+                FROM community_ratings
+                WHERE total_votes >= ?
+                {order_clause}
+                LIMIT ? OFFSET ?
+            """
+            rows = c.execute(query, (min_votes, limit, offset)).fetchall()
+        else:
+            where_sql = "WHERE total_votes >= ?"
+            params: list = [min_votes]
+            if search_clean:
+                where_sql += " AND LOWER(card_name) LIKE ?"
+                params.append(f"%{search_clean}%")
+            query = f"""
+                SELECT card_name, total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5, last_voted_at
+                FROM community_ratings
+                {where_sql}
+                {order_clause}
+            """
+            all_matching_rows = c.execute(query, params).fetchall()
+            if active_colors:
+                scryfall_cache_filter = load_scryfall_cache()
+                filtered_rows = []
+                base_colors = [col for col in active_colors if col not in ("C", "M")]
+                wants_c = "C" in active_colors
+                wants_m = "M" in active_colors
+                for r in all_matching_rows:
+                    info = lookup_card_info(scryfall_cache_filter, r['card_name']) or {}
+                    ci = info.get("color_identity", []) or []
+                    is_c = len(ci) == 0
+                    is_m = len(ci) > 1
+                    if not base_colors:
+                        is_match = (wants_c and is_c) or (wants_m and is_m)
+                    else:
+                        has_all_selected = all(col in ci for col in base_colors)
+                        has_no_extra = all(col in base_colors for col in ci)
+                        is_match = has_all_selected and has_no_extra
+                        if wants_m and is_m and has_all_selected:
+                            is_match = True
+                        if wants_c and is_c:
+                            is_match = True
+                    if is_match:
+                        filtered_rows.append(r)
+                all_matching_rows = filtered_rows
+            total_count = len(all_matching_rows)
+            rows = all_matching_rows[offset : offset + limit]
     finally:
         comm_conn.close()
 
@@ -2015,6 +2104,7 @@ async def api_community_card_random(request: Request):
 @app.post("/api/community/rate")
 async def api_community_rate(payload: VotePayload, request: Request):
     voter_hash = get_voter_hash(request)
+    _check_vote_rate_limit(request, voter_hash)
     return await run_in_threadpool(record_community_vote, payload.card_name, payload.score, voter_hash)
 
 @app.get("/api/community/leaderboard")
@@ -2022,11 +2112,13 @@ async def api_community_leaderboard(
     sort: str = "highest",
     min_votes: int = 2,
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
+    search: str = "",
+    colors: str = ""
 ):
     if sort not in ("highest", "most_voted", "lowest"):
         sort = "highest"
-    return await run_in_threadpool(get_community_leaderboard, sort, min_votes, limit, offset)
+    return await run_in_threadpool(get_community_leaderboard, sort, min_votes, limit, offset, search, colors)
 
 @app.get("/api/community/overview")
 async def api_community_overview():

@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import sqlite3
 import requests
@@ -31,7 +32,10 @@ def get_scryfall_session() -> requests.Session:
     session = getattr(_thread_local, "scryfall_session", None)
     if session is None:
         session = requests.Session()
-        session.headers.update({"User-Agent": "CentMeta/1.0 (privacy@centmeta.it)"})
+        session.headers.update({
+            "User-Agent": "CentMeta/1.0 (contact@centmeta.it; https://centmeta.it)",
+            "Accept": "application/json;q=0.9,*/*;q=0.8"
+        })
         _thread_local.scryfall_session = session
     return session
 
@@ -121,6 +125,7 @@ def setup_database_indices():
         conn.close()
 
 _scryfall_lock = threading.RLock()
+_SCRYFALL_COOLDOWN_UNTIL = 0.0
 _SCRYFALL_MISSING_CACHE = set()
 
 def clear_all_caches():
@@ -358,6 +363,7 @@ async def lifespan(app: FastAPI):
 
     setup_health_db(init_main_blacklist=True)
     setup_community_db()
+    cleanup_lands_from_community_db()
     sanitize_commanders_in_db()
     setup_database_indices()
 
@@ -507,7 +513,11 @@ def _is_valid_cached_card(entry: Optional[dict]) -> bool:
     return True
 
 def fetch_scryfall_data(card_names):
+    global _SCRYFALL_COOLDOWN_UNTIL
     results = load_scryfall_cache()
+    if std_time.time() < _SCRYFALL_COOLDOWN_UNTIL:
+        logging.warning("[SCRYFALL] Circuit breaker attivo: salto chiamate API esterne.")
+        return results
     mancanti = []
     actual_names = set()
     
@@ -549,7 +559,7 @@ def fetch_scryfall_data(card_names):
 
         for i in range(0, len(mancanti), 75):
             if i > 0:
-                std_time.sleep(0.1)
+                std_time.sleep(0.12)
                 
             chunk = mancanti[i:i+75]
             identifiers = [{"name": n} for n in chunk]
@@ -562,6 +572,10 @@ def fetch_scryfall_data(card_names):
                     json={"identifiers": identifiers}, 
                     timeout=15
                 )
+                if res.status_code in (429, 403):
+                    logging.warning(f"[SCRYFALL CIRCUIT BREAKER] Ricevuto HTTP {res.status_code}. Pausa forzata di 5 minuti.")
+                    _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
+                    break
                 if res.status_code == 200:
                     body = res.json()
                     
@@ -581,7 +595,7 @@ def fetch_scryfall_data(card_names):
                         )
                         
                         if is_reversible_override or is_showcase_or_weird:
-                            std_time.sleep(0.05) 
+                            std_time.sleep(0.12) 
                             query_name = faces_names[0] if is_reversible_override and faces_names else name
                             if is_reversible_override:
                                 q_str = f'!"{query_name}" -is:dfc -is:split -is:adventure -is:extra -is:promo -frame:showcase -layout:art_series -layout:token -type:card'
@@ -641,7 +655,7 @@ def fetch_scryfall_data(card_names):
                         resolved_via_named = False
                         if " // " in nf_name:
                             try:
-                                std_time.sleep(0.05)
+                                std_time.sleep(0.12)
                                 named_res = session.get(
                                     "https://api.scryfall.com/cards/named",
                                     params={"exact": nf_name},
@@ -1547,6 +1561,38 @@ BASIC_LANDS = {
     "snow-covered mountain", "snow-covered forest"
 }
 
+def is_land_card(card_name: str, scryfall_cache: Optional[dict] = None) -> bool:
+    if not card_name:
+        return False
+    if card_name.lower() in BASIC_LANDS:
+        return True
+    if scryfall_cache is None:
+        scryfall_cache = load_scryfall_cache()
+    info = lookup_card_info(scryfall_cache, card_name)
+    if not info:
+        return False
+    type_line = info.get("type", "")
+    front_type = type_line.split(" // ")[0] if " // " in type_line else type_line
+    return bool(re.search(r'\bLand\b', front_type, re.IGNORECASE))
+
+def cleanup_lands_from_community_db():
+    conn = get_community_db()
+    c = conn.cursor()
+    try:
+        scryfall_cache = load_scryfall_cache()
+        if not scryfall_cache:
+            return
+        rows = c.execute("SELECT card_name FROM community_ratings").fetchall()
+        lands = [r['card_name'] for r in rows if is_land_card(r['card_name'], scryfall_cache)]
+        if lands:
+            placeholders = ",".join("?" for _ in lands)
+            c.execute(f"DELETE FROM community_ratings WHERE card_name IN ({placeholders})", lands)
+            c.execute(f"DELETE FROM community_votes WHERE card_name IN ({placeholders})", lands)
+            conn.commit()
+            print(f"[COMMUNITY DB] Eliminate {len(lands)} terre dal database di valutazione.")
+    finally:
+        conn.close()
+
 def get_client_ip(request: Request) -> str:
     cf_ip = request.headers.get("cf-connecting-ip")
     if cf_ip:
@@ -1619,7 +1665,8 @@ def get_community_card_pools():
             ORDER BY cnt DESC
         """, (date_limit,)).fetchall()
 
-        filtered_cards = [r['card_name'] for r in rows if r['card_name'].lower() not in BASIC_LANDS]
+        scryfall_cache = load_scryfall_cache()
+        filtered_cards = [r['card_name'] for r in rows if not is_land_card(r['card_name'], scryfall_cache)]
 
         # Top 100 fisse (le colonne portanti del meta)
         core_100 = filtered_cards[:100]
@@ -1637,7 +1684,7 @@ def get_community_card_pools():
 
         # Fallback completo (tutte le carte non base del catalogo) per utenti che completano il pool
         rows_all = c.execute("SELECT DISTINCT card_name FROM deck_cards").fetchall()
-        fallback_all = [r['card_name'] for r in rows_all if r['card_name'].lower() not in BASIC_LANDS]
+        fallback_all = [r['card_name'] for r in rows_all if not is_land_card(r['card_name'], scryfall_cache)]
 
         _COMMUNITY_POOL_DATE = today_str
         _COMMUNITY_CORE_100 = core_100
@@ -1730,6 +1777,10 @@ def get_random_community_card(voter_hash: str):
         "user_score": user_vote_row['score'] if user_vote_row else None
     }
 
+    today_active_set = set(today_active_pool)
+    voted_today_count = len(today_active_set.intersection(voted_set))
+    pool_size = len(today_active_pool)
+
     return {
         "card_name": chosen_card,
         "images": info.get("images", []),
@@ -1742,7 +1793,12 @@ def get_random_community_card(voter_hash: str):
         "is_core_staple": is_core_staple,
         "is_daily_spotlight": is_daily_spotlight,
         "is_recent_pool": is_core_staple or is_daily_spotlight,
-        "community_stats": community_stats
+        "community_stats": community_stats,
+        "daily_progress": {
+            "voted_today": voted_today_count,
+            "pool_size": pool_size,
+            "total_voted": len(voted_set)
+        }
     }
 
 class VotePayload(BaseModel):
@@ -1805,6 +1861,13 @@ def record_community_vote(card_name: str, score: int, voter_hash: str):
             FROM community_ratings WHERE card_name = ?
         """, (card_name,)).fetchone()
 
+        core_100, daily_50, _ = get_community_card_pools()
+        today_active_set = set(core_100 + daily_50)
+        voted_rows = c.execute("SELECT card_name FROM community_votes WHERE voter_hash = ?", (voter_hash,)).fetchall()
+        all_voted_set = {r['card_name'] for r in voted_rows}
+        voted_today_count = len(today_active_set.intersection(all_voted_set))
+        pool_size = len(today_active_set)
+
         return {
             "status": "success",
             "card_name": card_name,
@@ -1817,6 +1880,11 @@ def record_community_vote(card_name: str, score: int, voter_hash: str):
                 3: updated['stars_3'] if updated else 0,
                 4: updated['stars_4'] if updated else 0,
                 5: updated['stars_5'] if updated else 0
+            },
+            "daily_progress": {
+                "voted_today": voted_today_count,
+                "pool_size": pool_size,
+                "total_voted": len(all_voted_set)
             }
         }
     finally:

@@ -33,7 +33,7 @@ def get_scryfall_session() -> requests.Session:
     if session is None:
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "CentMeta/1.0 (contact@centmeta.it; https://centmeta.it)",
+            "User-Agent": "CentMeta/1.0 (privacy@centmeta.it; https://centmeta.it)",
             "Accept": "application/json;q=0.9,*/*;q=0.8"
         })
         _thread_local.scryfall_session = session

@@ -64,7 +64,7 @@ venv\Scripts\activate
 
 4. Installare le dipendenze:
 ```bash
-pip install fastapi uvicorn requests
+pip install -r requirements.txt
 ```
 
 5. Configurare le variabili d'ambiente:
@@ -73,8 +73,10 @@ pip install fastapi uvicorn requests
 |---|---|---|
 | `MOXFIELD_UA` | Sì (per lo scraper) | User-Agent dedicato concordato con Moxfield. Senza questa variabile lo scraper e il ping di stato verso Moxfield non vengono eseguiti. |
 | `ADMIN_SECRET` | Sì (per l'endpoint admin) | Segreto richiesto nell'header `X-Admin-Secret` per rimuovere un mazzo e metterlo in blacklist. |
+| `COMMUNITY_SALT` | No | Salt segreto per pseudonimizzare i voti community. Se omesso, viene generato automaticamente un salt casuale in `.community_salt`. |
 | `SCRAPER_DRY_RUN` | No | Se vale `1`, lo scraper calcola le differenze senza scaricare né salvare nulla. |
 | `SCRAPER_FORCE` | No | Se vale `1`, salta il controllo di sicurezza sulla soglia minima dei risultati. |
+| `ALLOW_JSON_IMPORT` | No | Se vale `1`, autorizza la conversione distruttiva una-tantum da `database_centurion.json` verso SQLite. |
 
 6. Inizializzare il database e avviare il server:
 ```bash
@@ -92,13 +94,8 @@ Le API saranno disponibili all'indirizzo `http://localhost:8000`. La documentazi
 
 ## Conformità alla Privacy
 
-Il backend è progettato secondo logiche "Privacy-First". Le chiamate API sono processate in forma totalmente anonima. Non viene richiesto, elaborato o salvato alcun dato personale, indirizzo e-mail o identificativo di profilazione. I log di sistema (indirizzi IP e User-Agent) vengono processati localmente ed esclusivamente per la prevenzione di attacchi DDoS (Distributed Denial of Service) e per il monitoraggio della stabilità dell'infrastruttura, conformemente al principio di Legittimo Interesse (Art. 6, par. 1, lett. f del GDPR).
+Il backend è progettato secondo logiche "Privacy-First". Le chiamate API sono processate in forma totalmente anonima. Non viene richiesto, elaborato o salvato alcun dato anagrafico o identificativo di profilazione. Per la funzionalità facoltativa dell'Osservatorio Community, i voti sono memorizzati associati a un hash crittografico pseudonimo calcolato tramite SHA-256 e salt segreto di sistema per contrastare voti duplicati e manipolazioni statistiche (ballot stuffing), senza memorizzare indirizzi IP in chiaro nel database delle valutazioni. I log tecnici di sistema (indirizzi IP e User-Agent) vengono processati localmente ed esclusivamente per la prevenzione di attacchi informatici e per il monitoraggio della stabilità dell'infrastruttura, conformemente al principio di Legittimo Interesse (Art. 6, par. 1, lett. f del GDPR).
 
 ## Note Legali e Proprietà Intellettuale
 
 L'architettura del software backend e gli algoritmi di aggregazione dati sono proprietà intellettuale di Filippo Zanardi.
-
-Le liste analizzate derivano da liste rese pubbliche dai rispettivi autori su Moxfield. La raccolta avviene tramite un accesso concordato per iscritto con Moxfield, nel rispetto del limite di frequenza da loro indicato. Di ciascun mazzo vengono conservati solo l'identificativo pubblico, il comandante, la data di aggiornamento e l'elenco delle carte. Chi non desidera che un proprio mazzo sia incluso nelle statistiche può chiederne la rimozione scrivendo a privacy@centmeta.it. I metadati relativi alle carte sono forniti da Scryfall. CentMeta non è affiliato ufficialmente con nessuna di queste due piattaforme.
-
-**Wizards of the Coast Fan Content Policy:**
-CentMeta è un contenuto amatoriale non ufficiale consentito dalle Linee guida sui contenuti amatoriali. Non è approvato né autorizzato da Wizards. Parte dei materiali utilizzati è proprietà di Wizards of the Coast. © Wizards of the Coast LLC.

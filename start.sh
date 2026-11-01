@@ -13,7 +13,7 @@ ENV_FILE="${ENV_FILE:-$BASE_DIR/.env}"              # file con MOXFIELD_UA, ADMI
 BIND_HOST="${BIND_HOST:-127.0.0.1}"                 # solo locale: il traffico esterno passa dal proxy
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
-STOP_TIMEOUT="${STOP_TIMEOUT:-30}"                  # secondi concessi per lo shutdown pulito
+STOP_TIMEOUT="${STOP_TIMEOUT:-300}"                 # secondi concessi per lo shutdown pulito (fino a 5 min per scraper)
 
 log() { echo "[start.sh] $*"; }
 die() { echo "[start.sh] ERRORE: $*" >&2; exit 1; }
@@ -45,6 +45,9 @@ PID_FRONTEND=""
 stop_all() {
   trap - SIGINT SIGTERM
   log "Arresto in corso..."
+  if [[ -f "$BASE_DIR/scraper.lock" ]]; then
+    log "ATTENZIONE: Scraper attivo rilevato: attesa fino a ${STOP_TIMEOUT}s per chiusura transazione pulita."
+  fi
   for pid in $PID_BACKEND $PID_FRONTEND; do
     kill -TERM "$pid" 2>/dev/null || true
   done

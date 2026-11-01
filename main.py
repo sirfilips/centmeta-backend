@@ -4,6 +4,7 @@ import json
 import sqlite3
 import requests
 import asyncio
+import ipaddress
 import time as std_time
 import threading
 import logging
@@ -226,6 +227,19 @@ def _record_service_ping(c, now: str, service: str, request_fn, redact_secret: O
         )
     """, (service, service))
 
+def _get_last_ping_seconds_ago(cursor, service: str) -> Optional[float]:
+    row = cursor.execute(
+        "SELECT timestamp FROM health_logs WHERE service=? ORDER BY timestamp DESC LIMIT 1",
+        (service,)
+    ).fetchone()
+    if not row or not row["timestamp"]:
+        return None
+    try:
+        last_dt = datetime.fromisoformat(row["timestamp"])
+        return (datetime.now() - last_dt).total_seconds()
+    except Exception:
+        return None
+
 def _perform_health_pings():
     setup_health_db(init_main_blacklist=False)
     now = datetime.now().isoformat()
@@ -237,34 +251,38 @@ def _perform_health_pings():
         if moxfield_ua:
             moxfield_ua = moxfield_ua.strip()
         
-        # 1. Ping Scryfall
-        _record_service_ping(
-            c,
-            now,
-            "scryfall",
-            lambda: get_scryfall_session().get("https://api.scryfall.com/cards/named?exact=Sol Ring", timeout=10)
-        )
-        
-        # 2. Ping Moxfield
-        if not moxfield_ua:
-            logging.warning("[HEALTH WARNING] Variabile MOXFIELD_UA non impostata. Salto il ping a Moxfield.")
-        else:
+        # 1. Ping Scryfall (salta se già eseguito negli ultimi 45 minuti da un altro worker)
+        scry_sec = _get_last_ping_seconds_ago(c, "scryfall")
+        if scry_sec is None or scry_sec >= 2700:
             _record_service_ping(
                 c,
                 now,
-                "moxfield",
-                lambda: requests.get(
-                    "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
-                    headers={"User-Agent": moxfield_ua},
-                    timeout=10
-                ),
-                redact_secret=moxfield_ua
+                "scryfall",
+                lambda: get_scryfall_session().get("https://api.scryfall.com/cards/named?exact=Sol Ring", timeout=10)
             )
+        
+        # 2. Ping Moxfield (rispetta rigidamente il rate limiter di 1.2s condiviso con lo scraper)
+        if not moxfield_ua:
+            logging.warning("[HEALTH WARNING] Variabile MOXFIELD_UA non impostata. Salto il ping a Moxfield.")
+        else:
+            mox_sec = _get_last_ping_seconds_ago(c, "moxfield")
+            if mox_sec is None or mox_sec >= 2700:
+                _record_service_ping(
+                    c,
+                    now,
+                    "moxfield",
+                    lambda: master_scraper.rate_limited_get(
+                        "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
+                        headers={"User-Agent": moxfield_ua},
+                        timeout=10
+                    ),
+                    redact_secret=moxfield_ua
+                )
         
         conn.commit()
     finally:
         conn.close()
-    print(f"[HEALTH] Ping orario completato alle {now}")
+    print(f"[HEALTH] Controllo stato completato alle {now}")
 
 async def background_health_pinger():
     while True:
@@ -310,11 +328,13 @@ async def background_db_updater():
             await asyncio.sleep(seconds_to_wait)
             print("[CRON] Avvio aggiornamento giornaliero del database...")
             
-            await run_in_threadpool(master_scraper.run_scraper)
-            clear_all_caches()
-            
-            # Alle 23:00 scalda tutti i periodi
-            await warmup_caches()
+            scraped = await run_in_threadpool(master_scraper.run_scraper)
+            if scraped:
+                clear_all_caches()
+                # Alle 23:00 scalda tutti i periodi
+                await warmup_caches()
+            else:
+                print("[CRON] Scraper saltato o già in corso su un altro processo: cache conservate.")
             
         except asyncio.CancelledError:
             break
@@ -327,9 +347,32 @@ DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
 HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db")
 COMMUNITY_DB_PATH = os.path.join(CARTELLA_SCRIPT, "community.db")
 CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
-COMMUNITY_SALT = os.getenv("COMMUNITY_SALT") or "centmeta_community_salt_secret_2026"
-if not os.getenv("COMMUNITY_SALT"):
-    logging.warning("[SECURITY] Variabile d'ambiente COMMUNITY_SALT non impostata: in uso il fallback predefinito per compatibilità coi voti esistenti.")
+def _load_or_generate_salt() -> str:
+    env_salt = os.getenv("COMMUNITY_SALT")
+    if env_salt and env_salt.strip():
+        return env_salt.strip()
+
+    salt_file = os.path.join(CARTELLA_SCRIPT, ".community_salt")
+    try:
+        if os.path.exists(salt_file):
+            with open(salt_file, "r", encoding="utf-8") as f:
+                saved = f.read().strip()
+                if saved:
+                    return saved
+        new_salt = secrets.token_hex(32)
+        with open(salt_file, "w", encoding="utf-8") as f:
+            f.write(new_salt)
+        try:
+            os.chmod(salt_file, 0o600)
+        except Exception:
+            pass
+        logging.warning("[SECURITY] Variabile d'ambiente COMMUNITY_SALT non configurata: generata e salvata localmente in .community_salt")
+        return new_salt
+    except Exception as e:
+        logging.error(f"[SECURITY] Impossibile gestire il file di salt locale: {e}")
+        return secrets.token_hex(32)
+
+COMMUNITY_SALT = _load_or_generate_salt()
 
 _SCRYFALL_CACHE_MEMORY = None
 
@@ -1425,7 +1468,8 @@ async def get_decks_stats(filtro_tempo: str = "Tutti i tempi", comandante: Optio
             "cards": sliced_cards
         }
         
-    return data
+    # Restituisce una copia superficiale per prevenire mutazioni accidentali del dizionario in cache
+    return dict(data)
 
 def _get_card_details_safe(card_name: str, filtro_tempo: str):
     card_name = (card_name or "").strip()[:150]
@@ -1506,17 +1550,47 @@ async def get_health_status():
         "history": history
     }
 
+_ADMIN_FAILURES: dict[str, list[float]] = {}
+_ADMIN_LOCK = threading.Lock()
+
+def _check_admin_rate_limit(request: Request):
+    ip = get_client_ip(request)
+    now_ts = std_time.time()
+    with _ADMIN_LOCK:
+        if len(_ADMIN_FAILURES) > 500:
+            cutoff = now_ts - 3600.0
+            for k in list(_ADMIN_FAILURES.keys()):
+                _ADMIN_FAILURES[k] = [t for t in _ADMIN_FAILURES[k] if t > cutoff]
+                if not _ADMIN_FAILURES[k]:
+                    del _ADMIN_FAILURES[k]
+        recent_failures = [t for t in _ADMIN_FAILURES.get(ip, []) if now_ts - t < 3600.0]
+        if len(recent_failures) >= 10:
+            raise HTTPException(status_code=429, detail="Troppi tentativi admin falliti da questo indirizzo IP. Riprova più tardi.")
+        _ADMIN_FAILURES[ip] = recent_failures
+
+def _record_admin_failure(request: Request):
+    ip = get_client_ip(request)
+    now_ts = std_time.time()
+    with _ADMIN_LOCK:
+        failures = [t for t in _ADMIN_FAILURES.get(ip, []) if now_ts - t < 3600.0]
+        failures.append(now_ts)
+        _ADMIN_FAILURES[ip] = failures
+
 @app.delete("/api/admin/remove-deck/{deck_id}", include_in_schema=False)
 async def remove_deck(
+    request: Request,
     deck_id: str, 
     x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")
 ):
+    _check_admin_rate_limit(request)
     admin_password = os.getenv("ADMIN_SECRET")
     
     if not admin_password or not x_admin_secret:
+        _record_admin_failure(request)
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
         
     if not secrets.compare_digest(x_admin_secret.encode('utf-8'), admin_password.encode('utf-8')):
+        _record_admin_failure(request)
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
         
     conn = get_db()
@@ -1579,24 +1653,49 @@ def cleanup_lands_from_community_db():
     finally:
         conn.close()
 
+def _clean_ip(ip_str: Optional[str]) -> Optional[str]:
+    if not ip_str:
+        return None
+    candidate = ip_str.strip()
+    try:
+        parsed = ipaddress.ip_address(candidate)
+        return str(parsed)
+    except ValueError:
+        return None
+
 def get_client_ip(request: Request) -> str:
-    cf_ip = request.headers.get("cf-connecting-ip")
+    # 1. CF-Connecting-IP: sovrascritto in modo sicuro dall'edge di Cloudflare
+    cf_ip = _clean_ip(request.headers.get("cf-connecting-ip"))
     if cf_ip:
-        return cf_ip.strip()
+        return cf_ip
+
+    # 2. X-Real-IP: impostato da reverse proxy locali (es. Nginx)
+    x_real_ip = _clean_ip(request.headers.get("x-real-ip"))
+    if x_real_ip:
+        return x_real_ip
+
+    # 3. X-Forwarded-For: analizza a ritroso la catena per evitare IP spoofati all'inizio
     x_forwarded_for = request.headers.get("x-forwarded-for")
     if x_forwarded_for:
-        return x_forwarded_for.split(",")[0].strip()
-    x_real_ip = request.headers.get("x-real-ip")
-    if x_real_ip:
-        return x_real_ip.strip()
-    if request.client:
-        return request.client.host
+        parts = [p.strip() for p in x_forwarded_for.split(",") if p.strip()]
+        for part in reversed(parts):
+            valid_ip = _clean_ip(part)
+            if valid_ip:
+                return valid_ip
+
+    # 4. Connessione TCP diretta
+    if request.client and request.client.host:
+        valid_client = _clean_ip(request.client.host)
+        if valid_client:
+            return valid_client
+
     return "127.0.0.1"
 
 _VOTER_TOKEN_RE = re.compile(r"^[a-zA-Z0-9_-]{16,64}$")
 _VOTE_RATE_LIMIT_LOCK = threading.Lock()
 _IP_VOTE_TIMESTAMPS: dict[str, list[float]] = {}
 _IP_VOTER_HASHES: dict[str, dict[str, float]] = {}
+_IP_CARD_VOTES: dict[str, dict[str, tuple[str, float]]] = {}
 
 def get_voter_hash(request: Request) -> str:
     voter_token = request.headers.get("x-voter-token", "").strip()
@@ -1608,10 +1707,13 @@ def get_voter_hash(request: Request) -> str:
         payload = f"{COMMUNITY_SALT}:ip:{ip}:{ua}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-def _check_vote_rate_limit(request: Request, voter_hash: str):
+def _check_vote_rate_limit(request: Request, voter_hash: str, card_name: str):
     ip = get_client_ip(request)
     now_ts = std_time.time()
+    clean_card = (card_name or "").strip()
+
     with _VOTE_RATE_LIMIT_LOCK:
+        # Pulizia periodica dizionari in-memory
         if len(_IP_VOTE_TIMESTAMPS) > 2000:
             cutoff_min = now_ts - 60.0
             for k in list(_IP_VOTE_TIMESTAMPS.keys()):
@@ -1624,14 +1726,36 @@ def _check_vote_rate_limit(request: Request, voter_hash: str):
                 _IP_VOTER_HASHES[k] = {vh: t for vh, t in _IP_VOTER_HASHES[k].items() if t > cutoff_hr}
                 if not _IP_VOTER_HASHES[k]:
                     del _IP_VOTER_HASHES[k]
+        if len(_IP_CARD_VOTES) > 5000:
+            cutoff_day = now_ts - 86400.0
+            for k in list(_IP_CARD_VOTES.keys()):
+                _IP_CARD_VOTES[k] = {c: val for c, val in _IP_CARD_VOTES[k].items() if val[1] > cutoff_day}
+                if not _IP_CARD_VOTES[k]:
+                    del _IP_CARD_VOTES[k]
 
+        # 1. Limite globale frequenza voti per IP (max 60 al minuto)
         recent_votes = [t for t in _IP_VOTE_TIMESTAMPS.get(ip, []) if now_ts - t < 60.0]
         if len(recent_votes) >= 60:
             raise HTTPException(status_code=429, detail="Troppi voti ravvicinati. Riprova tra qualche secondo.")
 
+        # 2. Limite sessioni distinte per IP (max 5 token diversi all'ora per IP)
         ip_hashes = {vh: t for vh, t in _IP_VOTER_HASHES.get(ip, {}).items() if now_ts - t < 3600.0}
         if voter_hash not in ip_hashes and len(ip_hashes) >= 5:
             raise HTTPException(status_code=429, detail="Limite di sessioni di voto per questo indirizzo IP raggiunto.")
+
+        # 3. Protezione Ballot Stuffing: impedisce allo stesso IP di votare sulla stessa carta
+        # con token/sessioni diverse nelle ultime 24 ore
+        if clean_card:
+            card_votes = _IP_CARD_VOTES.get(ip, {})
+            if clean_card in card_votes:
+                prev_vh, prev_t = card_votes[clean_card]
+                if now_ts - prev_t < 86400.0 and prev_vh != voter_hash:
+                    raise HTTPException(
+                        status_code=429, 
+                        detail="Questo indirizzo IP ha già registrato una valutazione per questa carta con un'altra sessione."
+                    )
+            card_votes[clean_card] = (voter_hash, now_ts)
+            _IP_CARD_VOTES[ip] = card_votes
 
         recent_votes.append(now_ts)
         _IP_VOTE_TIMESTAMPS[ip] = recent_votes
@@ -2104,7 +2228,7 @@ async def api_community_card_random(request: Request):
 @app.post("/api/community/rate")
 async def api_community_rate(payload: VotePayload, request: Request):
     voter_hash = get_voter_hash(request)
-    _check_vote_rate_limit(request, voter_hash)
+    _check_vote_rate_limit(request, voter_hash, payload.card_name)
     return await run_in_threadpool(record_community_vote, payload.card_name, payload.score, voter_hash)
 
 @app.get("/api/community/leaderboard")

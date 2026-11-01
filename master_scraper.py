@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import sqlite3
 import time
@@ -22,6 +23,7 @@ cartella_script = os.path.dirname(os.path.abspath(__file__))
 db_path = os.path.join(cartella_script, "centurion.db")
 json_path = os.path.join(cartella_script, "database_centurion.json")
 log_path = os.path.join(cartella_script, "scraper.log")
+lock_path = os.path.join(cartella_script, "scraper.lock")
 
 # Configurazione del Logging
 logging.basicConfig(
@@ -33,11 +35,63 @@ logging.basicConfig(
     ]
 )
 
+class ScraperProcessLock:
+    """
+    Lock a livello di processo del sistema operativo per garantire che una sola
+    istanza dello scraper sia attiva contemporaneamente su tutta la macchina.
+    Compatibile sia con Linux/Unix (fcntl.flock) sia con Windows (msvcrt.locking).
+    """
+    def __init__(self, lock_file_path: str):
+        self.lock_file_path = lock_file_path
+        self.file_handle = None
+
+    def __enter__(self):
+        try:
+            self.file_handle = open(self.lock_file_path, "a+")
+            if sys.platform != "win32":
+                import fcntl
+                fcntl.flock(self.file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                import msvcrt
+                self.file_handle.seek(0)
+                msvcrt.locking(self.file_handle.fileno(), msvcrt.LK_NBLCK, 1)
+            self.file_handle.seek(0)
+            self.file_handle.truncate()
+            self.file_handle.write(f"{os.getpid()}\n")
+            self.file_handle.flush()
+            return True
+        except (BlockingIOError, OSError, IOError):
+            if self.file_handle:
+                try:
+                    self.file_handle.close()
+                except Exception:
+                    pass
+                self.file_handle = None
+            return False
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.file_handle:
+            try:
+                if sys.platform != "win32":
+                    import fcntl
+                    fcntl.flock(self.file_handle, fcntl.LOCK_UN)
+                else:
+                    import msvcrt
+                    self.file_handle.seek(0)
+                    msvcrt.locking(self.file_handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+            try:
+                self.file_handle.close()
+            except Exception:
+                pass
+            self.file_handle = None
+
 # Inizializza la sessione HTTP globale e lo stato del rate limiter
 session = requests.Session()
 last_request_time = 0.0
 
-def rate_limited_get(url, params=None, timeout=15):
+def rate_limited_get(url, params=None, headers=None, timeout=15):
     """
     Esegue una richiesta GET garantendo che passino almeno 1.2 secondi
     dall'inizio della richiesta precedente.
@@ -48,7 +102,7 @@ def rate_limited_get(url, params=None, timeout=15):
     if elapsed < 1.2:
         time.sleep(1.2 - elapsed)
     last_request_time = time.monotonic()
-    return session.get(url, params=params, timeout=timeout)
+    return session.get(url, params=params, headers=headers, timeout=timeout)
 
 def normalize_partner_commander(cmd_name):
     """Normalizza e ordina alfabeticamente i nomi dei comandanti Partner (' / ')."""
@@ -88,6 +142,8 @@ def ensure_covering_indices(cursor):
 
 def init_db(db_path):
     conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout = 30000;")
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS decks (
@@ -195,12 +251,19 @@ def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-def run_scraper():
+def run_scraper() -> bool:
+    with ScraperProcessLock(lock_path) as acquired:
+        if not acquired:
+            logging.warning("[LOCK] Un'altra istanza dello scraper è già in esecuzione. Operazione ignorata.")
+            return False
+        return _run_scraper_locked()
+
+def _run_scraper_locked() -> bool:
     # Verifica e impostazione dello User-Agent obbligatorio
     ua = os.environ.get("MOXFIELD_UA")
     if not ua:
         logging.error("Variabile d'ambiente MOXFIELD_UA non impostata")
-        return
+        return False
         
     ua = ua.strip()
     session.headers.update({"User-Agent": ua})
@@ -209,15 +272,24 @@ def run_scraper():
     
     init_db(db_path)
 
-    # 1. IMPORTAZIONE JSON STORICO (con Transazione Sicura, Blacklist e Rinomina)
+    # 1. IMPORTAZIONE JSON STORICO (abilitata solo se esplicitamente autorizzata con ALLOW_JSON_IMPORT=1)
+    allow_json_migration = os.environ.get("ALLOW_JSON_IMPORT") == "1"
     if os.path.exists(json_path) and not is_dry_run:
-        logging.info(f"Trovato il file '{json_path}'. Conversione diretta in SQLite in corso...")
+        if not allow_json_migration:
+            logging.warning(
+                f"File '{json_path}' rilevato ma ignorato per sicurezza (evita azzeramento accidentale del DB). "
+                "Per autorizzare l'importazione, avviare con ALLOW_JSON_IMPORT=1."
+            )
+        else:
+            logging.info(f"Trovato il file '{json_path}' e autorizzato ALLOW_JSON_IMPORT=1. Conversione diretta in SQLite in corso...")
         import_success = False
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 database_pulito = json.load(f)
 
             conn = sqlite3.connect(db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout = 30000;")
             try:
                 cursor = conn.cursor()
                 cursor.execute("SELECT id_moxfield FROM blacklist")
@@ -259,7 +331,7 @@ def run_scraper():
                     os.replace(json_path, new_json_path)
                 except Exception as e:
                     logging.error(f"Impossibile rinominare {json_path} post-import: {e}")
-                return
+                return True
         except Exception as e:
             logging.error(f"Errore nell'import JSON: {type(e).__name__} - {e}. Procedo con il download web...")
     elif os.path.exists(json_path) and is_dry_run:
@@ -270,6 +342,7 @@ def run_scraper():
     blacklisted_ids = set()
     try:
         conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA busy_timeout = 30000;")
         cursor = conn.cursor()
         cursor.execute("SELECT id_moxfield, data_aggiornamento FROM decks")
         for row in cursor.fetchall():
@@ -346,7 +419,7 @@ def run_scraper():
 
     if search_failed:
         logging.error("Fase di ricerca fallita. Interruzione senza modificare il database.")
-        return
+        return False
 
     # 4. CONTROLLO DI SICUREZZA SOGLIA (Safety Check)
     force_run = os.environ.get("SCRAPER_FORCE") == "1"
@@ -358,7 +431,7 @@ def run_scraper():
             logging.error(f"CRITICO: Trovati solo {num_search_decks} mazzi, contro {num_db_decks} nel DB "
                           f"(soglia minima per non svuotare: {int(num_db_decks * SOGLIA_MINIMA_RISULTATI)}). "
                           "Possibile errore API Moxfield. Interruzione per sicurezza.")
-            return
+            return False
 
     # 5. CONFRONTO E CREAZIONE CODE (Delta/Incremental Logic)
     to_download = []
@@ -406,7 +479,7 @@ def run_scraper():
         logging.info(f"Da Aggiornare (da scaricare): {stat_updated}")
         logging.info(f"Da Rimuovere (mancanti o blacklist): {len(db_removed_ids)}")
         logging.info("Dry run concluso. Nessuna chiamata di dettaglio e nessun dato salvato.")
-        return
+        return True
 
     # 7. DOWNLOAD INCREMENTALE
     downloaded_data = {}
@@ -454,6 +527,8 @@ def run_scraper():
 
     logging.info("Avvio scrittura incrementale nel DB (Transazione sicura)...")
     conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout = 30000;")
     try:
         cursor = conn.cursor()
         
@@ -507,10 +582,11 @@ def run_scraper():
         logging.info(f"Falliti: {stat_failed_kept} (tenuti vecchi) / {stat_failed_skipped} (scartati)")
         logging.info(f"Rimossi dal DB (non più online o in blacklist): {len(final_removed_ids)}")
         logging.info("Finito! I dati incrementali sono pronti per CentMeta.")
-        
+        return True
     except Exception as e:
         conn.rollback()
         logging.error(f"Errore critico durante la scrittura nel DB: {type(e).__name__} - {e}. Rollback effettuato.")
+        return False
     finally:
         conn.close()
 

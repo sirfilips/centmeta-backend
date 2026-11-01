@@ -25,3 +25,8 @@ cloudflared-linux-amd64.deb
 
 # Ignora il frontend (gestito in un repository separato)
 frontend/
+
+# Lock e segreti generati localmente
+*.lock
+scraper.lock
+.community_salt

@@ -49,6 +49,9 @@ jobs:
           echo "[Deploy] Navigazione nella directory di produzione..."
           cd /home/CenturionREC
           
+          echo "[Deploy] Reset modifiche locali ai file tracciati (es. package-lock.json)..."
+          git checkout -- .
+          
           echo "[Deploy] Git pull da main..."
           git pull --ff-only origin main
           

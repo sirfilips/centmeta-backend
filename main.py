@@ -109,6 +109,7 @@ def setup_database_indices():
 _scryfall_lock = threading.RLock()
 _community_lock = threading.RLock()
 _expansions_lock = threading.RLock()
+_expansions_fetch_lock = threading.Lock()
 _SCRYFALL_COOLDOWN_UNTIL = 0.0
 _SCRYFALL_MISSING_CACHE = set()
 
@@ -990,130 +991,155 @@ def get_recent_expansions_metadata() -> List[dict]:
     curr_mtime = get_db_mtime()
     prerelease_cutoff = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
 
+    # Fast path: controllo memoria o cache disco recente protetto da lock leggero
     with _expansions_lock:
         if _EXPANSIONS_CACHE_MEMORY is not None and _EXPANSIONS_CACHE_DATE == today_str:
             return _EXPANSIONS_CACHE_MEMORY
 
         disk_data = _load_disk_expansions_cache()
-        if disk_data and disk_data.get("date") == today_str and disk_data.get("cutoff") == prerelease_cutoff and disk_data.get("db_mtime") == curr_mtime and len(disk_data.get("expansions", [])) >= 3:
+        if (
+            disk_data
+            and disk_data.get("date") == today_str
+            and disk_data.get("cutoff") == prerelease_cutoff
+            and disk_data.get("db_mtime") == curr_mtime
+            and len(disk_data.get("expansions", [])) > 0
+        ):
             _EXPANSIONS_CACHE_MEMORY = disk_data["expansions"]
             _EXPANSIONS_CACHE_DATE = today_str
             return _EXPANSIONS_CACHE_MEMORY
 
-    if std_time.time() < _SCRYFALL_COOLDOWN_UNTIL:
-        logging.warning("[SCRYFALL SETS] Circuit breaker attivo: uso eventuale cache set su disco.")
-        if disk_data and disk_data.get("expansions"):
-            return disk_data["expansions"]
-        return []
+    # Slow path: serializzazione fetch verso Scryfall per prevenire cache stampede e 429
+    with _expansions_fetch_lock:
+        with _expansions_lock:
+            if _EXPANSIONS_CACHE_MEMORY is not None and _EXPANSIONS_CACHE_DATE == today_str:
+                return _EXPANSIONS_CACHE_MEMORY
 
-    _, global_cards = get_global_cards_stats()
-    if not global_cards:
-        return disk_data.get("expansions", []) if disk_data else []
+            disk_data = _load_disk_expansions_cache()
+            if (
+                disk_data
+                and disk_data.get("date") == today_str
+                and disk_data.get("cutoff") == prerelease_cutoff
+                and disk_data.get("db_mtime") == curr_mtime
+                and len(disk_data.get("expansions", [])) > 0
+            ):
+                _EXPANSIONS_CACHE_MEMORY = disk_data["expansions"]
+                _EXPANSIONS_CACHE_DATE = today_str
+                return _EXPANSIONS_CACHE_MEMORY
 
-    global_cards_lower = set()
-    for k in global_cards.keys():
-        kl = k.strip().lower()
-        global_cards_lower.add(kl)
-        if " // " in kl:
-            global_cards_lower.add(kl.split(" // ")[0].strip())
+        if std_time.time() < _SCRYFALL_COOLDOWN_UNTIL:
+            logging.warning("[SCRYFALL SETS] Circuit breaker attivo: uso eventuale cache set su disco.")
+            if disk_data and disk_data.get("expansions"):
+                return disk_data["expansions"]
+            return []
 
-    session = get_scryfall_session()
-    try:
-        res = session.get("https://api.scryfall.com/sets", timeout=15)
-        if res.status_code in (429, 403):
-            _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
+        _, global_cards = get_global_cards_stats()
+        if not global_cards:
             return disk_data.get("expansions", []) if disk_data else []
-        if res.status_code != 200:
+
+        global_cards_lower = set()
+        for k in global_cards.keys():
+            kl = k.strip().lower()
+            global_cards_lower.add(kl)
+            if " // " in kl:
+                global_cards_lower.add(kl.split(" // ")[0].strip())
+
+        session = get_scryfall_session()
+        try:
+            res = session.get("https://api.scryfall.com/sets", timeout=15)
+            if res.status_code in (429, 403):
+                _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
+                return disk_data.get("expansions", []) if disk_data else []
+            if res.status_code != 200:
+                return disk_data.get("expansions", []) if disk_data else []
+            all_sets = res.json().get("data", [])
+        except Exception as e:
+            logging.warning(f"Errore API Scryfall /sets: {e}")
             return disk_data.get("expansions", []) if disk_data else []
-        all_sets = res.json().get("data", [])
-    except Exception as e:
-        logging.warning(f"Errore API Scryfall /sets: {e}")
-        return disk_data.get("expansions", []) if disk_data else []
 
-    valid_types = {"expansion", "core", "draft_innovation", "commander"}
-    companion_types = {"commander", "eternal", "draft_innovation", "expansion"}
+        valid_types = {"expansion", "core", "draft_innovation", "commander"}
+        companion_types = {"commander", "eternal", "draft_innovation", "expansion"}
 
-    released_sets = [
-        s for s in all_sets
-        if not s.get("digital")
-        and s.get("released_at")
-        and s["released_at"] <= prerelease_cutoff
-    ]
+        released_sets = [
+            s for s in all_sets
+            if not s.get("digital")
+            and s.get("released_at")
+            and s["released_at"] <= prerelease_cutoff
+        ]
 
-    children_by_parent: Dict[str, List[str]] = {}
-    for s in released_sets:
-        p_code = s.get("parent_set_code")
-        if p_code and s.get("set_type") in companion_types and s.get("card_count", 0) > 0:
-            children_by_parent.setdefault(p_code, []).append(s["code"])
+        children_by_parent: Dict[str, List[str]] = {}
+        for s in released_sets:
+            p_code = s.get("parent_set_code")
+            if p_code and s.get("set_type") in companion_types and s.get("card_count", 0) > 0:
+                children_by_parent.setdefault(p_code, []).append(s["code"])
 
-    root_candidates = [
-        s for s in released_sets
-        if not s.get("parent_set_code")
-        and s.get("set_type") in valid_types
-        and s.get("card_count", 0) >= 20
-    ]
-    root_candidates.sort(key=lambda s: s.get("released_at", ""), reverse=True)
+        root_candidates = [
+            s for s in released_sets
+            if not s.get("parent_set_code")
+            and s.get("set_type") in valid_types
+            and s.get("card_count", 0) >= 20
+        ]
+        root_candidates.sort(key=lambda s: s.get("released_at", ""), reverse=True)
 
-    selected_expansions = []
-    for root in root_candidates[:10]:
-        if len(selected_expansions) >= 3:
-            break
-
-        root_code = root["code"]
-        codes = [root_code] + children_by_parent.get(root_code, [])
-        sets_or = " OR ".join(f"e:{c}" for c in codes)
-        q_str = f"({sets_or}) -is:reprint -is:funny -t:basic"
-
-        exp_card_keys = set()
-        next_url = "https://api.scryfall.com/cards/search"
-        params: Optional[dict] = {"q": q_str}
-        pages_fetched = 0
-
-        while next_url and pages_fetched < 6:
-            std_time.sleep(0.12)
-            pages_fetched += 1
-            try:
-                s_res = session.get(next_url, params=params, timeout=15)
-                params = None
-                if s_res.status_code in (429, 403):
-                    _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
-                    next_url = None
-                    break
-                if s_res.status_code != 200:
-                    next_url = None
-                    break
-                s_body = s_res.json()
-                for c_obj in s_body.get("data", []):
-                    c_name = c_obj.get("name", "").strip()
-                    if not c_name:
-                        continue
-                    c_lower = c_name.lower()
-                    exp_card_keys.add(c_lower)
-                    if " // " in c_lower:
-                        exp_card_keys.add(c_lower.split(" // ")[0].strip())
-                next_url = s_body.get("next_page") if s_body.get("has_more") else None
-            except Exception as e:
-                logging.warning(f"Errore ricerca carte espansione {root_code}: {e}")
+        selected_expansions = []
+        for root in root_candidates[:10]:
+            if len(selected_expansions) >= 3:
                 break
 
-        if exp_card_keys & global_cards_lower:
-            selected_expansions.append({
-                "code": root_code.upper(),
-                "codes": [c.upper() for c in codes],
-                "name": root.get("name", root_code.upper()),
-                "released_at": root.get("released_at", ""),
-                "icon_svg_uri": root.get("icon_svg_uri", ""),
-                "card_keys": sorted(list(exp_card_keys))
-            })
+            root_code = root["code"]
+            codes = [root_code] + children_by_parent.get(root_code, [])
+            sets_or = " OR ".join(f"e:{c}" for c in codes)
+            q_str = f"({sets_or}) -is:reprint -is:funny -t:basic"
 
-    if selected_expansions:
-        with _expansions_lock:
-            _EXPANSIONS_CACHE_MEMORY = selected_expansions
-            _EXPANSIONS_CACHE_DATE = today_str
-        _save_disk_expansions_cache({"date": today_str, "cutoff": prerelease_cutoff, "db_mtime": curr_mtime, "expansions": selected_expansions})
-        return selected_expansions
+            exp_card_keys = set()
+            next_url = "https://api.scryfall.com/cards/search"
+            params: Optional[dict] = {"q": q_str}
+            pages_fetched = 0
 
-    return disk_data.get("expansions", []) if disk_data else []
+            while next_url and pages_fetched < 6:
+                std_time.sleep(0.12)
+                pages_fetched += 1
+                try:
+                    s_res = session.get(next_url, params=params, timeout=15)
+                    params = None
+                    if s_res.status_code in (429, 403):
+                        _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
+                        next_url = None
+                        break
+                    if s_res.status_code != 200:
+                        next_url = None
+                        break
+                    s_body = s_res.json()
+                    for c_obj in s_body.get("data", []):
+                        c_name = c_obj.get("name", "").strip()
+                        if not c_name:
+                            continue
+                        c_lower = c_name.lower()
+                        exp_card_keys.add(c_lower)
+                        if " // " in c_lower:
+                            exp_card_keys.add(c_lower.split(" // ")[0].strip())
+                    next_url = s_body.get("next_page") if s_body.get("has_more") else None
+                except Exception as e:
+                    logging.warning(f"Errore ricerca carte espansione {root_code}: {e}")
+                    break
+
+            if exp_card_keys & global_cards_lower:
+                selected_expansions.append({
+                    "code": root_code.upper(),
+                    "codes": [c.upper() for c in codes],
+                    "name": root.get("name", root_code.upper()),
+                    "released_at": root.get("released_at", ""),
+                    "icon_svg_uri": root.get("icon_svg_uri", ""),
+                    "card_keys": sorted(list(exp_card_keys))
+                })
+
+        if selected_expansions:
+            with _expansions_lock:
+                _EXPANSIONS_CACHE_MEMORY = selected_expansions
+                _EXPANSIONS_CACHE_DATE = today_str
+            _save_disk_expansions_cache({"date": today_str, "cutoff": prerelease_cutoff, "db_mtime": curr_mtime, "expansions": selected_expansions})
+            return selected_expansions
+
+        return disk_data.get("expansions", []) if disk_data else []
 
 
 @lru_cache(maxsize=32)

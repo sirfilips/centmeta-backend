@@ -108,6 +108,7 @@ def setup_database_indices():
 
 _scryfall_lock = threading.RLock()
 _community_lock = threading.RLock()
+_expansions_lock = threading.RLock()
 _SCRYFALL_COOLDOWN_UNTIL = 0.0
 _SCRYFALL_MISSING_CACHE = set()
 
@@ -115,9 +116,13 @@ def clear_all_caches():
     global _SCRYFALL_CACHE_MEMORY
     global _COMMUNITY_POOL_DATE, _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL, _COMMUNITY_VALID_CARDS_SET
     global _DECKS_COUNT_30D_DATE
+    global _EXPANSIONS_CACHE_MEMORY, _EXPANSIONS_CACHE_DATE
     with _scryfall_lock:
         _SCRYFALL_CACHE_MEMORY = None
         _SCRYFALL_MISSING_CACHE.clear()
+    with _expansions_lock:
+        _EXPANSIONS_CACHE_MEMORY = None
+        _EXPANSIONS_CACHE_DATE = ""
     with _community_lock:
         _COMMUNITY_POOL_DATE = ""
         _COMMUNITY_CORE_100 = []
@@ -347,6 +352,9 @@ DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
 HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db")
 COMMUNITY_DB_PATH = os.path.join(CARTELLA_SCRIPT, "community.db")
 CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
+SETS_CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_sets_cache.json")
+_EXPANSIONS_CACHE_MEMORY = None
+_EXPANSIONS_CACHE_DATE = ""
 def _load_or_generate_salt() -> str:
     env_salt = os.getenv("COMMUNITY_SALT")
     if env_salt and env_salt.strip():
@@ -868,6 +876,7 @@ def get_global_cards_stats():
     global_cards = {r["card_name"]: r["g_freq"] for r in gc_rows}
     return global_total, global_cards
 
+
 @lru_cache(maxsize=32)
 def get_valid_commanders_set(filtro_tempo: str):
     _, invalid_cmds = get_global_commanders_validity()
@@ -944,6 +953,168 @@ def get_valid_commanders_set(filtro_tempo: str):
             })
             
     return frozenset(valid_set), result_list
+
+
+def _load_disk_expansions_cache() -> Optional[dict]:
+    try:
+        if os.path.exists(SETS_CACHE_FILE):
+            with open(SETS_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get("expansions"), list):
+                    return data
+    except Exception as e:
+        logging.warning(f"Errore lettura cache set Scryfall: {e}")
+    return None
+
+def _save_disk_expansions_cache(data: dict):
+    tmp_file = f"{SETS_CACHE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp_file, SETS_CACHE_FILE)
+    except Exception as e:
+        logging.warning(f"Errore salvataggio cache set Scryfall: {e}")
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
+
+def get_recent_expansions_metadata() -> List[dict]:
+    """
+    Recupera e mette in cache giornaliera i metadati e la lista di carte nuove (-is:reprint)
+    delle ultime 3 espansioni maggiori (inclusi i relativi set Commander/Eternal abbinati)
+    che abbiano almeno una carta giocata nel database Centurion.
+    """
+    global _EXPANSIONS_CACHE_MEMORY, _EXPANSIONS_CACHE_DATE, _SCRYFALL_COOLDOWN_UNTIL
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    curr_mtime = get_db_mtime()
+    prerelease_cutoff = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    with _expansions_lock:
+        if _EXPANSIONS_CACHE_MEMORY is not None and _EXPANSIONS_CACHE_DATE == today_str:
+            return _EXPANSIONS_CACHE_MEMORY
+
+        disk_data = _load_disk_expansions_cache()
+        if disk_data and disk_data.get("date") == today_str and disk_data.get("cutoff") == prerelease_cutoff and disk_data.get("db_mtime") == curr_mtime and len(disk_data.get("expansions", [])) >= 3:
+            _EXPANSIONS_CACHE_MEMORY = disk_data["expansions"]
+            _EXPANSIONS_CACHE_DATE = today_str
+            return _EXPANSIONS_CACHE_MEMORY
+
+    if std_time.time() < _SCRYFALL_COOLDOWN_UNTIL:
+        logging.warning("[SCRYFALL SETS] Circuit breaker attivo: uso eventuale cache set su disco.")
+        if disk_data and disk_data.get("expansions"):
+            return disk_data["expansions"]
+        return []
+
+    _, global_cards = get_global_cards_stats()
+    if not global_cards:
+        return disk_data.get("expansions", []) if disk_data else []
+
+    global_cards_lower = set()
+    for k in global_cards.keys():
+        kl = k.strip().lower()
+        global_cards_lower.add(kl)
+        if " // " in kl:
+            global_cards_lower.add(kl.split(" // ")[0].strip())
+
+    session = get_scryfall_session()
+    try:
+        res = session.get("https://api.scryfall.com/sets", timeout=15)
+        if res.status_code in (429, 403):
+            _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
+            return disk_data.get("expansions", []) if disk_data else []
+        if res.status_code != 200:
+            return disk_data.get("expansions", []) if disk_data else []
+        all_sets = res.json().get("data", [])
+    except Exception as e:
+        logging.warning(f"Errore API Scryfall /sets: {e}")
+        return disk_data.get("expansions", []) if disk_data else []
+
+    valid_types = {"expansion", "core", "draft_innovation", "commander"}
+    companion_types = {"commander", "eternal", "draft_innovation", "expansion"}
+
+    released_sets = [
+        s for s in all_sets
+        if not s.get("digital")
+        and s.get("released_at")
+        and s["released_at"] <= prerelease_cutoff
+    ]
+
+    children_by_parent: Dict[str, List[str]] = {}
+    for s in released_sets:
+        p_code = s.get("parent_set_code")
+        if p_code and s.get("set_type") in companion_types and s.get("card_count", 0) > 0:
+            children_by_parent.setdefault(p_code, []).append(s["code"])
+
+    root_candidates = [
+        s for s in released_sets
+        if not s.get("parent_set_code")
+        and s.get("set_type") in valid_types
+        and s.get("card_count", 0) >= 20
+    ]
+    root_candidates.sort(key=lambda s: s.get("released_at", ""), reverse=True)
+
+    selected_expansions = []
+    for root in root_candidates[:10]:
+        if len(selected_expansions) >= 3:
+            break
+
+        root_code = root["code"]
+        codes = [root_code] + children_by_parent.get(root_code, [])
+        sets_or = " OR ".join(f"e:{c}" for c in codes)
+        q_str = f"({sets_or}) -is:reprint -is:funny -t:basic"
+
+        exp_card_keys = set()
+        next_url = "https://api.scryfall.com/cards/search"
+        params: Optional[dict] = {"q": q_str}
+        pages_fetched = 0
+
+        while next_url and pages_fetched < 6:
+            std_time.sleep(0.12)
+            pages_fetched += 1
+            try:
+                s_res = session.get(next_url, params=params, timeout=15)
+                params = None
+                if s_res.status_code in (429, 403):
+                    _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
+                    next_url = None
+                    break
+                if s_res.status_code != 200:
+                    next_url = None
+                    break
+                s_body = s_res.json()
+                for c_obj in s_body.get("data", []):
+                    c_name = c_obj.get("name", "").strip()
+                    if not c_name:
+                        continue
+                    c_lower = c_name.lower()
+                    exp_card_keys.add(c_lower)
+                    if " // " in c_lower:
+                        exp_card_keys.add(c_lower.split(" // ")[0].strip())
+                next_url = s_body.get("next_page") if s_body.get("has_more") else None
+            except Exception as e:
+                logging.warning(f"Errore ricerca carte espansione {root_code}: {e}")
+                break
+
+        if exp_card_keys & global_cards_lower:
+            selected_expansions.append({
+                "code": root_code.upper(),
+                "codes": [c.upper() for c in codes],
+                "name": root.get("name", root_code.upper()),
+                "released_at": root.get("released_at", ""),
+                "icon_svg_uri": root.get("icon_svg_uri", ""),
+                "card_keys": sorted(list(exp_card_keys))
+            })
+
+    if selected_expansions:
+        with _expansions_lock:
+            _EXPANSIONS_CACHE_MEMORY = selected_expansions
+            _EXPANSIONS_CACHE_DATE = today_str
+        _save_disk_expansions_cache({"date": today_str, "cutoff": prerelease_cutoff, "db_mtime": curr_mtime, "expansions": selected_expansions})
+        return selected_expansions
+
+    return disk_data.get("expansions", []) if disk_data else []
+
 
 @lru_cache(maxsize=32)
 def get_dashboard_data_cached(filtro_tempo: str):
@@ -1070,6 +1241,86 @@ def get_dashboard_data_cached(filtro_tempo: str):
     for r in df_hot_cmd: all_names.add(r['comandante'])
     for r in df_top_cards: all_names.add(r['card_name'])
     for r in df_hot_c: all_names.add(r['card_name'])
+
+    expansions_meta = get_recent_expansions_metadata()
+    expansion_raw_list = []
+    key_to_exp_code: Dict[str, str] = {}
+    for exp in expansions_meta:
+        exp_code = exp["code"]
+        valid_keys = set(exp.get("card_keys", []))
+        for vk in valid_keys:
+            if vk not in key_to_exp_code:
+                key_to_exp_code[vk] = exp_code
+
+        def _in_exp(c_name: str, vk=valid_keys) -> bool:
+            kl = (c_name or "").strip().lower()
+            if kl in vk:
+                return True
+            if " // " in kl and kl.split(" // ")[0].strip() in vk:
+                return True
+            return False
+
+        curr_exp_rows = [r for r in curr_card_rows if _in_exp(r['card_name'])]
+        if prev_cond:
+            prev_exp_rows = [r for r in prev_card_rows if _in_exp(r['card_name'])]
+            prev_exp_ranks = {r['card_name']: idx + 1 for idx, r in enumerate(prev_exp_rows)}
+            exp_df = []
+            for idx, r in enumerate(curr_exp_rows[:250]):
+                c_name = r['card_name']
+                trend = prev_exp_ranks[c_name] - (idx + 1) if c_name in prev_exp_ranks else None
+                exp_df.append({'card_name': c_name, 'freq': r['freq'], 'trend': trend, 'set_code': exp_code})
+        else:
+            exp_df = [{'card_name': r['card_name'], 'freq': r['freq'], 'trend': "", 'set_code': exp_code} for r in curr_exp_rows[:250]]
+
+        for r in exp_df:
+            all_names.add(r['card_name'])
+
+        expansion_raw_list.append((exp, exp_df, len(curr_exp_rows)))
+
+    if len(expansions_meta) > 1:
+        def _resolve_exp_code(c_name: str) -> Optional[str]:
+            kl = (c_name or "").strip().lower()
+            if kl in key_to_exp_code:
+                return key_to_exp_code[kl]
+            if " // " in kl:
+                front = kl.split(" // ")[0].strip()
+                if front in key_to_exp_code:
+                    return key_to_exp_code[front]
+            return None
+
+        curr_all_exp_rows = [r for r in curr_card_rows if _resolve_exp_code(r['card_name']) is not None]
+        if prev_cond:
+            prev_all_exp_rows = [r for r in prev_card_rows if _resolve_exp_code(r['card_name']) is not None]
+            prev_all_exp_ranks = {r['card_name']: idx + 1 for idx, r in enumerate(prev_all_exp_rows)}
+            all_exp_df = []
+            for idx, r in enumerate(curr_all_exp_rows[:250]):
+                c_name = r['card_name']
+                trend = prev_all_exp_ranks[c_name] - (idx + 1) if c_name in prev_all_exp_ranks else None
+                all_exp_df.append({
+                    'card_name': c_name,
+                    'freq': r['freq'],
+                    'trend': trend,
+                    'set_code': _resolve_exp_code(c_name)
+                })
+        else:
+            all_exp_df = [{
+                'card_name': r['card_name'],
+                'freq': r['freq'],
+                'trend': "",
+                'set_code': _resolve_exp_code(r['card_name'])
+            } for r in curr_all_exp_rows[:250]]
+
+        for r in all_exp_df:
+            all_names.add(r['card_name'])
+
+        combined_exp_meta = {
+            "code": "ALL",
+            "codes": [e["code"] for e in expansions_meta],
+            "name": "Tutte le ultime espansioni",
+            "released_at": "",
+            "icon_svg_uri": ""
+        }
+        expansion_raw_list.append((combined_exp_meta, all_exp_df, len(curr_all_exp_rows)))
     
     scryfall_cache = fetch_scryfall_data(list(all_names))
 
@@ -1097,7 +1348,8 @@ def get_dashboard_data_cached(filtro_tempo: str):
             "trend": trend_out,
             "delta": int(row.get('delta', 0)) if 'delta' in row else None,
             "category": cat,
-            "color_identity": final_color_identity
+            "color_identity": final_color_identity,
+            "set_code": row.get("set_code")
         }
 
     try:
@@ -1112,7 +1364,19 @@ def get_dashboard_data_cached(filtro_tempo: str):
         "top_commanders": [format_item(row, 'comandante', True) for row in df_top_cmd],
         "hot_commanders": [format_item(row, 'comandante', True) for row in df_hot_cmd],
         "top_cards": [format_item(row, 'card_name', False) for row in df_top_cards],
-        "hot_cards": [format_item(row, 'card_name', False) for row in df_hot_c]
+        "hot_cards": [format_item(row, 'card_name', False) for row in df_hot_c],
+        "recent_expansions": [
+            {
+                "code": exp["code"],
+                "codes": exp.get("codes", [exp["code"]]),
+                "name": exp["name"],
+                "released_at": exp["released_at"],
+                "icon_svg_uri": exp["icon_svg_uri"],
+                "total_played_cards": total_played,
+                "cards": [format_item(row, 'card_name', False) for row in exp_df]
+            }
+            for exp, exp_df, total_played in expansion_raw_list
+        ]
     }
 
 @lru_cache(maxsize=128)
@@ -1516,6 +1780,8 @@ async def get_commander_decks(comandante: str, filtro_tempo: str = "Tutti i temp
 @app.get("/api/home/dashboard")
 async def get_dashboard(filtro_tempo: str = "Tutti i tempi"):
     filtro_tempo = normalize_period(filtro_tempo)
+    if _EXPANSIONS_CACHE_DATE and _EXPANSIONS_CACHE_DATE != datetime.now().strftime("%Y-%m-%d"):
+        get_dashboard_data_cached.cache_clear()
     return await run_in_threadpool(get_dashboard_data_cached, filtro_tempo)
 
 @app.get("/api/health")

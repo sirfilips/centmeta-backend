@@ -13,6 +13,7 @@ health.db*
 
 # Cache temporanee e File di Log
 scryfall_cache.json
+scryfall_sets_cache.json
 scraper.log
 
 # Pacchetti scaricati e file di sistema

@@ -107,17 +107,32 @@ def setup_database_indices():
         conn.close()
 
 _scryfall_lock = threading.RLock()
+_scryfall_file_lock = threading.Lock()
 _community_lock = threading.RLock()
 _expansions_lock = threading.RLock()
 _expansions_fetch_lock = threading.Lock()
-_SCRYFALL_COOLDOWN_UNTIL = 0.0
+_daily_cache_lock = threading.Lock()
+_LAST_CACHE_DATE = datetime.now().strftime("%Y-%m-%d")
+_scryfall_rate_lock = threading.Lock()
+_scryfall_last_request_ts = 0.0
 _SCRYFALL_MISSING_CACHE = set()
+
+def _wait_scryfall_rate_limit(min_interval: float = 0.11):
+    """Garantisce almeno min_interval secondi tra richieste consecutive verso Scryfall."""
+    global _scryfall_last_request_ts
+    with _scryfall_rate_lock:
+        now = std_time.monotonic()
+        elapsed = now - _scryfall_last_request_ts
+        if elapsed < min_interval:
+            std_time.sleep(min_interval - elapsed)
+        _scryfall_last_request_ts = std_time.monotonic()
 
 def clear_all_caches():
     global _SCRYFALL_CACHE_MEMORY
     global _COMMUNITY_POOL_DATE, _COMMUNITY_CORE_100, _COMMUNITY_DAILY_50, _COMMUNITY_FALLBACK_ALL, _COMMUNITY_VALID_CARDS_SET
     global _DECKS_COUNT_30D_DATE
     global _EXPANSIONS_CACHE_MEMORY, _EXPANSIONS_CACHE_DATE
+    global _LAST_CACHE_DATE
     with _scryfall_lock:
         _SCRYFALL_CACHE_MEMORY = None
         _SCRYFALL_MISSING_CACHE.clear()
@@ -139,7 +154,21 @@ def clear_all_caches():
     get_card_details_cached.cache_clear()
     get_commander_decks_cached.cache_clear()
     get_dashboard_data_cached.cache_clear()
+    get_metagame_history_cached.cache_clear()
+    _LAST_CACHE_DATE = datetime.now().strftime("%Y-%m-%d")
     print("[CACHE] Tutte le cache in memoria sono state svuotate.")
+
+def ensure_daily_caches_fresh():
+    """Invalida le cache @lru_cache al cambio giorno anche se lo scraper notturno non è stato eseguito."""
+    global _LAST_CACHE_DATE
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if _LAST_CACHE_DATE == today_str:
+        return
+    with _daily_cache_lock:
+        if _LAST_CACHE_DATE == today_str:
+            return
+        clear_all_caches()
+        _LAST_CACHE_DATE = today_str
 
 def setup_health_db(init_main_blacklist: bool = True):
     if init_main_blacklist:
@@ -475,11 +504,12 @@ def load_scryfall_cache():
     global _SCRYFALL_CACHE_MEMORY
     with _scryfall_lock:
         if _SCRYFALL_CACHE_MEMORY is not None:
-            return _SCRYFALL_CACHE_MEMORY
+            return _SCRYFALL_CACHE_MEMORY.copy()
         try:
             if os.path.exists(CACHE_FILE):
                 with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    _SCRYFALL_CACHE_MEMORY = json.load(f)
+                    loaded = json.load(f)
+                    _SCRYFALL_CACHE_MEMORY = loaded if isinstance(loaded, dict) else {}
             else:
                 _SCRYFALL_CACHE_MEMORY = {}
         except Exception as e:
@@ -491,25 +521,45 @@ def load_scryfall_cache():
             except Exception:
                 pass
             _SCRYFALL_CACHE_MEMORY = {}
-        return _SCRYFALL_CACHE_MEMORY
+        return _SCRYFALL_CACHE_MEMORY.copy()
+
+def _write_scryfall_cache_to_disk():
+    with _scryfall_file_lock:
+        with _scryfall_lock:
+            snapshot = (_SCRYFALL_CACHE_MEMORY or {}).copy()
+        tmp_file = f"{CACHE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f)
+            os.replace(tmp_file, CACHE_FILE)
+        except Exception as e:
+            logging.warning(f"Errore durante il salvataggio della cache Scryfall: {e}")
+            try:
+                os.remove(tmp_file)
+            except OSError:
+                pass
 
 def save_scryfall_cache(cache):
     global _SCRYFALL_CACHE_MEMORY
     with _scryfall_lock:
-        _SCRYFALL_CACHE_MEMORY = cache
-        snapshot = cache.copy()
-        
-    tmp_file = f"{CACHE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f)
-        os.replace(tmp_file, CACHE_FILE)
-    except Exception as e:
-        logging.warning(f"Errore durante il salvataggio della cache Scryfall: {e}")
-        try:
-            os.remove(tmp_file)
-        except OSError:
-            pass
+        _SCRYFALL_CACHE_MEMORY = cache.copy()
+    _write_scryfall_cache_to_disk()
+
+def _commit_scryfall_cache_updates(new_entries: dict, delete_keys: Optional[List[str]] = None) -> dict:
+    global _SCRYFALL_CACHE_MEMORY
+    with _scryfall_lock:
+        if _SCRYFALL_CACHE_MEMORY is None:
+            _SCRYFALL_CACHE_MEMORY = {}
+        updated = _SCRYFALL_CACHE_MEMORY.copy()
+        if delete_keys:
+            for k in delete_keys:
+                updated.pop(k, None)
+        if new_entries:
+            updated.update(new_entries)
+        _SCRYFALL_CACHE_MEMORY = updated
+        snapshot = updated.copy()
+    _write_scryfall_cache_to_disk()
+    return snapshot
 
 def _parse_scryfall_card_object(card: dict) -> dict:
     name = card.get("name", "")
@@ -558,11 +608,7 @@ def _is_valid_cached_card(entry: Optional[dict]) -> bool:
     return True
 
 def fetch_scryfall_data(card_names):
-    global _SCRYFALL_COOLDOWN_UNTIL
     results = load_scryfall_cache()
-    if std_time.time() < _SCRYFALL_COOLDOWN_UNTIL:
-        logging.warning("[SCRYFALL] Circuit breaker attivo: salto chiamate API esterne.")
-        return results
     mancanti = []
     actual_names = set()
     
@@ -576,10 +622,13 @@ def fetch_scryfall_data(card_names):
             actual_names.add(n.strip())
 
     cache_updated_locally = False
+    bad_keys_to_delete: List[str] = []
+    new_entries: Dict[str, dict] = {}
     with _scryfall_lock:
         # Rimuove eventuali voci corrotte "Card" (Jumpstart theme cards)
         for bad_key in [k for k, v in results.items() if v.get("type") in ("Card", " Card // Card")]:
             del results[bad_key]
+            bad_keys_to_delete.append(bad_key)
             cache_updated_locally = True
 
         for n in actual_names:
@@ -591,6 +640,7 @@ def fetch_scryfall_data(card_names):
             # Supporto carte ribilanciate Arena (es. "A-Unholy Heat" -> "Unholy Heat")
             if key.startswith("a-") and _is_valid_cached_card(results.get(key[2:])):
                 results[key] = results[key[2:]]
+                new_entries[key] = results[key[2:]]
                 cache_updated_locally = True
                 continue
             mancanti.append(n)
@@ -602,21 +652,27 @@ def fetch_scryfall_data(card_names):
         weird_sets = {"sta", "otp", "wot", "mul", "brr", "sld", "mps", "mp2", "exp", "mb1", "plist", "h1r", "slx"}
 
         for i in range(0, len(mancanti), 75):
-            if i > 0:
-                std_time.sleep(0.12)
-                
             chunk = mancanti[i:i+75]
             identifiers = [{"name": n} for n in chunk]
             
             try:
+                _wait_scryfall_rate_limit()
                 res = session.post(
                     "https://api.scryfall.com/cards/collection", 
                     json={"identifiers": identifiers}, 
                     timeout=15
                 )
+                if res.status_code == 429:
+                    std_time.sleep(1.5)
+                    _wait_scryfall_rate_limit()
+                    res = session.post(
+                        "https://api.scryfall.com/cards/collection",
+                        json={"identifiers": identifiers},
+                        timeout=15
+                    )
+
                 if res.status_code in (429, 403):
-                    logging.warning(f"[SCRYFALL CIRCUIT BREAKER] Ricevuto HTTP {res.status_code}. Pausa forzata di 5 minuti.")
-                    _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
+                    logging.warning(f"[SCRYFALL] Ricevuto HTTP {res.status_code} su /cards/collection; interrompo solo questo batch.")
                     break
                 if res.status_code == 200:
                     body = res.json()
@@ -663,13 +719,16 @@ def fetch_scryfall_data(card_names):
 
                         with _scryfall_lock:
                             results[name.lower()] = card_data
+                            new_entries[name.lower()] = card_data
                             if " // " in name and len(faces_names) > 1:
                                 f0 = faces_names[0].strip().lower()
                                 f1 = faces_names[1].strip().lower()
                                 if not _is_valid_cached_card(results.get(f0)) or " // " in results[f0].get("full_name", " // "):
                                     results[f0] = card_data
+                                    new_entries[f0] = card_data
                                 if not _is_valid_cached_card(results.get(f1)) or " // " in results[f1].get("full_name", " // "):
                                     results[f1] = card_data
+                                    new_entries[f1] = card_data
 
                             # Allinea eventuali alias richiesti nel chunk (es. "Waste Land" -> "Wasteland")
                             norm_target = name.lower().replace(" ", "").replace("-", "")
@@ -677,6 +736,7 @@ def fetch_scryfall_data(card_names):
                                 req_k = req_n.lower()
                                 if req_k not in results and req_k.replace(" ", "").replace("-", "") == norm_target:
                                     results[req_k] = card_data
+                                    new_entries[req_k] = card_data
 
                         any_updated = True
 
@@ -690,6 +750,7 @@ def fetch_scryfall_data(card_names):
                         if nf_key.startswith("a-") and _is_valid_cached_card(results.get(nf_key[2:])):
                             with _scryfall_lock:
                                 results[nf_key] = results[nf_key[2:]]
+                                new_entries[nf_key] = results[nf_key[2:]]
                             any_updated = True
                             continue
 
@@ -712,10 +773,13 @@ def fetch_scryfall_data(card_names):
                                         with _scryfall_lock:
                                             results[nf_key] = card_data
                                             results[c_name.lower()] = card_data
+                                            new_entries[nf_key] = card_data
+                                            new_entries[c_name.lower()] = card_data
                                             for f_part in faces:
                                                 fk = f_part.lower()
                                                 if not _is_valid_cached_card(results.get(fk)) or " // " in results[fk].get("full_name", " // "):
                                                     results[fk] = card_data
+                                                    new_entries[fk] = card_data
                                         any_updated = True
                                         resolved_via_named = True
                             except Exception as e:
@@ -729,7 +793,7 @@ def fetch_scryfall_data(card_names):
                 logging.warning(f"Errore API Scryfall collection: {e}")
 
     if any_updated:
-        save_scryfall_cache(results)
+        results = _commit_scryfall_cache_updates(new_entries, bad_keys_to_delete)
                     
     return results
 
@@ -986,7 +1050,7 @@ def get_recent_expansions_metadata() -> List[dict]:
     delle ultime 3 espansioni maggiori (inclusi i relativi set Commander/Eternal abbinati)
     che abbiano almeno una carta giocata nel database Centurion.
     """
-    global _EXPANSIONS_CACHE_MEMORY, _EXPANSIONS_CACHE_DATE, _SCRYFALL_COOLDOWN_UNTIL
+    global _EXPANSIONS_CACHE_MEMORY, _EXPANSIONS_CACHE_DATE
     today_str = datetime.now().strftime("%Y-%m-%d")
     curr_mtime = get_db_mtime()
     prerelease_cutoff = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
@@ -1026,12 +1090,6 @@ def get_recent_expansions_metadata() -> List[dict]:
                 _EXPANSIONS_CACHE_DATE = today_str
                 return _EXPANSIONS_CACHE_MEMORY
 
-        if std_time.time() < _SCRYFALL_COOLDOWN_UNTIL:
-            logging.warning("[SCRYFALL SETS] Circuit breaker attivo: uso eventuale cache set su disco.")
-            if disk_data and disk_data.get("expansions"):
-                return disk_data["expansions"]
-            return []
-
         _, global_cards = get_global_cards_stats()
         if not global_cards:
             return disk_data.get("expansions", []) if disk_data else []
@@ -1045,11 +1103,10 @@ def get_recent_expansions_metadata() -> List[dict]:
 
         session = get_scryfall_session()
         try:
+            _wait_scryfall_rate_limit()
             res = session.get("https://api.scryfall.com/sets", timeout=15)
-            if res.status_code in (429, 403):
-                _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
-                return disk_data.get("expansions", []) if disk_data else []
-            if res.status_code != 200:
+            if res.status_code in (429, 403) or res.status_code != 200:
+                logging.warning(f"[SCRYFALL SETS] HTTP {res.status_code} su /sets: uso eventuale cache su disco.")
                 return disk_data.get("expansions", []) if disk_data else []
             all_sets = res.json().get("data", [])
         except Exception as e:
@@ -1096,15 +1153,11 @@ def get_recent_expansions_metadata() -> List[dict]:
             pages_fetched = 0
 
             while next_url and pages_fetched < 6:
-                std_time.sleep(0.12)
+                _wait_scryfall_rate_limit()
                 pages_fetched += 1
                 try:
                     s_res = session.get(next_url, params=params, timeout=15)
                     params = None
-                    if s_res.status_code in (429, 403):
-                        _SCRYFALL_COOLDOWN_UNTIL = std_time.time() + 300
-                        next_url = None
-                        break
                     if s_res.status_code != 200:
                         next_url = None
                         break
@@ -1496,17 +1549,19 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
         if not info:
             info = {"images": [], "art_crops": [], "type": "Altro", "oracles": [], "color_identity": [], "cmc": 0}
             
-        cat = categorizza_tipo(info.get("type", ""))
+        type_line = info.get("type", "")
+        front_type = type_line.split(" // ")[0] if " // " in type_line else type_line
+        cat = categorizza_tipo(type_line)
         
         avg_copies_comp = float(row['freq']) / total_decks
         somma_univoche += avg_copies_comp
         
         if cat in type_dist:
             type_dist[cat] += avg_copies_comp
-        elif cat == "Altro" and "Land" in info.get("type", ""):
+        elif cat == "Altro" and "Land" in front_type:
             type_dist["Terre"] += avg_copies_comp
         
-        if cat not in ["Terre", "Altro"] and "Land" not in info.get("type", ""):
+        if cat not in ["Terre", "Altro"] and "Land" not in front_type:
             cmc = int(info.get("cmc", 0))
             if cmc >= 6: cmc = 6
             mana_curve[cmc] += avg_copies_comp
@@ -1737,12 +1792,14 @@ def normalize_period(p: str) -> str:
 
 @app.get("/api/commanders")
 async def get_commanders(filtro_tempo: str = "Tutti i tempi"):
+    ensure_daily_caches_fresh()
     filtro_tempo = normalize_period(filtro_tempo)
     _, result_list = await run_in_threadpool(get_valid_commanders_set, filtro_tempo)
     return result_list
 
 @app.get("/api/decks/stats")
 async def get_decks_stats(filtro_tempo: str = "Tutti i tempi", comandante: Optional[str] = None, limit: int = 0, offset: int = 0):
+    ensure_daily_caches_fresh()
     filtro_tempo = normalize_period(filtro_tempo)
     limit = max(0, min(limit, 500))
     offset = max(0, offset)
@@ -1793,11 +1850,13 @@ def _get_card_details_safe(card_name: str, filtro_tempo: str):
 
 @app.get("/api/card/details")
 async def get_card_details(card_name: str, filtro_tempo: str = "Tutti i tempi"):
+    ensure_daily_caches_fresh()
     filtro_tempo = normalize_period(filtro_tempo)
     return await run_in_threadpool(_get_card_details_safe, card_name, filtro_tempo)
 
 @app.get("/api/commander/decks")
 async def get_commander_decks(comandante: str, filtro_tempo: str = "Tutti i tempi", limit: int = 0, offset: int = 0):
+    ensure_daily_caches_fresh()
     filtro_tempo = normalize_period(filtro_tempo)
     limit = max(0, min(limit, 500))
     offset = max(0, offset)
@@ -1805,10 +1864,236 @@ async def get_commander_decks(comandante: str, filtro_tempo: str = "Tutti i temp
 
 @app.get("/api/home/dashboard")
 async def get_dashboard(filtro_tempo: str = "Tutti i tempi"):
+    ensure_daily_caches_fresh()
     filtro_tempo = normalize_period(filtro_tempo)
-    if _EXPANSIONS_CACHE_DATE and _EXPANSIONS_CACHE_DATE != datetime.now().strftime("%Y-%m-%d"):
-        get_dashboard_data_cached.cache_clear()
     return await run_in_threadpool(get_dashboard_data_cached, filtro_tempo)
+
+_ITALIAN_MONTHS_SHORT = (
+    "", "Gen", "Feb", "Mar", "Apr", "Mag", "Giu",
+    "Lug", "Ago", "Set", "Ott", "Nov", "Dic"
+)
+
+def _format_history_label(period_key: str, granularity: str) -> str:
+    try:
+        if granularity == "week":
+            dt = datetime.strptime(period_key, "%Y-%m-%d")
+            return f"{dt.day:02d} {_ITALIAN_MONTHS_SHORT[dt.month]}"
+        year_s, month_s = period_key.split("-", 1)
+        m_idx = int(month_s)
+        if 1 <= m_idx <= 12:
+            return f"{_ITALIAN_MONTHS_SHORT[m_idx]} {year_s[2:]}"
+    except Exception:
+        pass
+    return period_key
+
+@lru_cache(maxsize=16)
+def get_metagame_history_cached(granularity: str = "month", months: int = 12, top_n: int = 6):
+    granularity = "week" if granularity == "week" else "month"
+    months = max(3, min(int(months), 24))
+    top_n = max(3, min(int(top_n), 8))
+
+    _, invalid_cmds = get_global_commanders_validity()
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        bucket_expr = (
+            "date(data_aggiornamento, 'weekday 1', '-7 days')"
+            if granularity == "week"
+            else "substr(data_aggiornamento, 1, 7)"
+        )
+        where_parts = [
+            "data_aggiornamento IS NOT NULL",
+            "data_aggiornamento != ''",
+            "data_aggiornamento >= strftime('%Y-%m-%dT%H:%M:%S', 'now', ?)",
+        ]
+        params: list = [f"-{months} months"]
+        if invalid_cmds:
+            placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+            where_parts.append(f"comandante NOT IN {placeholders}")
+            params.extend(invalid_cmds)
+
+        query = f"""
+            SELECT {bucket_expr} AS period_key,
+                   comandante,
+                   COUNT(DISTINCT id_moxfield) AS deck_count
+            FROM decks
+            WHERE {' AND '.join(where_parts)}
+            GROUP BY period_key, comandante
+            ORDER BY period_key ASC
+        """
+        rows = c.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    period_totals: dict[str, int] = {}
+    period_cmds: dict[str, dict[str, int]] = {}
+    global_cmd_totals: dict[str, int] = {}
+
+    for r in rows:
+        pkey = r["period_key"]
+        cmd = r["comandante"]
+        cnt = int(r["deck_count"] or 0)
+        if not pkey or not cmd or cnt <= 0:
+            continue
+        period_totals[pkey] = period_totals.get(pkey, 0) + cnt
+        if pkey not in period_cmds:
+            period_cmds[pkey] = {}
+        period_cmds[pkey][cmd] = period_cmds[pkey].get(cmd, 0) + cnt
+        global_cmd_totals[cmd] = global_cmd_totals.get(cmd, 0) + cnt
+
+    sorted_periods = sorted(period_totals.keys())
+    if not sorted_periods:
+        return {
+            "granularity": granularity,
+            "months": months,
+            "top_n": top_n,
+            "top_commanders": [],
+            "buckets": [],
+            "movers": {"rising": [], "falling": []},
+            "summary": {
+                "total_decks": 0,
+                "periods_count": 0,
+                "unique_commanders": 0,
+                "peak_period": None,
+                "most_diverse_period": None,
+            },
+        }
+
+    top_cmd_names = [
+        cmd for cmd, _ in sorted(global_cmd_totals.items(), key=lambda x: (-x[1], x[0]))[:top_n]
+    ]
+    scryfall_cache = fetch_scryfall_data(list(global_cmd_totals.keys()))
+
+    cmd_color_map = {}
+    for cmd in global_cmd_totals.keys():
+        _, _, _, _, color_id = extract_commander_metadata(cmd, scryfall_cache)
+        cmd_color_map[cmd] = color_id
+
+    top_commanders_meta = []
+    total_decks_window = sum(period_totals.values())
+    for cmd in top_cmd_names:
+        _, imgs, _, _, color_id = extract_commander_metadata(cmd, scryfall_cache)
+        cnt = global_cmd_totals[cmd]
+        top_commanders_meta.append({
+            "name": cmd,
+            "total_decks": cnt,
+            "avg_share": round((cnt / total_decks_window) * 100, 2) if total_decks_window > 0 else 0.0,
+            "color_identity": color_id,
+            "image": imgs[0] if imgs else None,
+        })
+
+    buckets = []
+    peak_period = None
+    most_diverse_period = None
+
+    for pkey in sorted_periods:
+        tot = period_totals[pkey]
+        cmds_map = period_cmds[pkey]
+        unique_cnt = len(cmds_map)
+        top_sum = 0
+        cmd_entries = {}
+        for cmd in top_cmd_names:
+            c_cnt = cmds_map.get(cmd, 0)
+            top_sum += c_cnt
+            cmd_entries[cmd] = {
+                "count": c_cnt,
+                "share": round((c_cnt / tot) * 100, 2) if tot > 0 else 0.0,
+            }
+        others_cnt = max(0, tot - top_sum)
+
+        color_counts = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0}
+        for cmd_name_p, c_cnt_p in cmds_map.items():
+            cid = cmd_color_map.get(cmd_name_p, [])
+            if not cid:
+                color_counts["C"] += c_cnt_p
+            else:
+                for col in cid:
+                    if col in color_counts:
+                        color_counts[col] += c_cnt_p
+
+        color_shares = {
+            col: round((cnt_val / tot) * 100, 1) if tot > 0 else 0.0
+            for col, cnt_val in color_counts.items()
+        }
+
+        bucket = {
+            "period": pkey,
+            "label": _format_history_label(pkey, granularity),
+            "total_decks": tot,
+            "unique_commanders": unique_cnt,
+            "commanders": cmd_entries,
+            "top_share": round((top_sum / tot) * 100, 2) if tot > 0 else 0.0,
+            "others_count": others_cnt,
+            "others_share": round((others_cnt / tot) * 100, 2) if tot > 0 else 0.0,
+            "color_shares": color_shares,
+        }
+        buckets.append(bucket)
+        if peak_period is None or tot > peak_period["total_decks"]:
+            peak_period = {"period": pkey, "label": bucket["label"], "total_decks": tot}
+        if most_diverse_period is None or unique_cnt > most_diverse_period["unique_commanders"]:
+            most_diverse_period = {"period": pkey, "label": bucket["label"], "unique_commanders": unique_cnt}
+
+    rising = []
+    falling = []
+    if len(sorted_periods) >= 2:
+        mid = len(sorted_periods) // 2
+        first_half = sorted_periods[:mid]
+        second_half = sorted_periods[mid:]
+        first_total = sum(period_totals[p] for p in first_half)
+        second_total = sum(period_totals[p] for p in second_half)
+
+        if first_total > 0 and second_total > 0:
+            deltas = []
+            for cmd, tot_cmd in global_cmd_totals.items():
+                if tot_cmd < 3:
+                    continue
+                first_cnt = sum(period_cmds[p].get(cmd, 0) for p in first_half)
+                second_cnt = sum(period_cmds[p].get(cmd, 0) for p in second_half)
+                first_share = (first_cnt / first_total) * 100
+                second_share = (second_cnt / second_total) * 100
+                delta = round(second_share - first_share, 2)
+                if abs(delta) >= 0.2:
+                    _, imgs, _, _, color_id = extract_commander_metadata(cmd, scryfall_cache)
+                    deltas.append({
+                        "name": cmd,
+                        "first_share": round(first_share, 2),
+                        "second_share": round(second_share, 2),
+                        "delta_share": delta,
+                        "total_decks": tot_cmd,
+                        "color_identity": color_id,
+                        "image": imgs[0] if imgs else None,
+                    })
+            rising = sorted([d for d in deltas if d["delta_share"] > 0], key=lambda x: -x["delta_share"])[:5]
+            falling = sorted([d for d in deltas if d["delta_share"] < 0], key=lambda x: x["delta_share"])[:5]
+
+    global_total_decks, _ = get_global_cards_stats()
+    try:
+        last_upd_iso = datetime.fromtimestamp(get_db_mtime()).isoformat()
+    except Exception:
+        last_upd_iso = None
+
+    return {
+        "granularity": granularity,
+        "months": months,
+        "top_n": top_n,
+        "top_commanders": top_commanders_meta,
+        "buckets": buckets,
+        "movers": {"rising": rising, "falling": falling},
+        "summary": {
+            "total_decks": total_decks_window,
+            "global_total_decks": global_total_decks,
+            "last_updated": last_upd_iso,
+            "periods_count": len(buckets),
+            "unique_commanders": len(global_cmd_totals),
+            "peak_period": peak_period,
+            "most_diverse_period": most_diverse_period,
+        },
+    }
+
+@app.get("/api/metagame/history")
+async def get_metagame_history(granularity: str = "month", months: int = 12, top_n: int = 6):
+    ensure_daily_caches_fresh()
+    return await run_in_threadpool(get_metagame_history_cached, granularity, months, top_n)
 
 @app.get("/api/health")
 async def get_health_status():
@@ -1955,7 +2240,38 @@ def _clean_ip(ip_str: Optional[str]) -> Optional[str]:
     except ValueError:
         return None
 
+def _get_trusted_proxy_networks():
+    nets = [
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("::1/128"),
+    ]
+    extra = os.getenv("TRUSTED_PROXY_IPS", "")
+    for item in extra.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logging.warning(f"[SECURITY] Voce TRUSTED_PROXY_IPS non valida ignorata: {item}")
+    return tuple(nets)
+
+_TRUSTED_PROXY_NETWORKS = _get_trusted_proxy_networks()
+
+def _is_trusted_proxy(ip_str: Optional[str]) -> bool:
+    if not ip_str:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip_str.strip())
+        return any(addr in net for net in _TRUSTED_PROXY_NETWORKS)
+    except ValueError:
+        return False
+
 def get_client_ip(request: Request) -> str:
+    peer_ip = _clean_ip(request.client.host) if (request.client and request.client.host) else None
+    if not _is_trusted_proxy(peer_ip):
+        return peer_ip or "127.0.0.1"
+
     # 1. CF-Connecting-IP: sovrascritto in modo sicuro dall'edge di Cloudflare
     cf_ip = _clean_ip(request.headers.get("cf-connecting-ip"))
     if cf_ip:
@@ -1966,22 +2282,21 @@ def get_client_ip(request: Request) -> str:
     if x_real_ip:
         return x_real_ip
 
-    # 3. X-Forwarded-For: analizza a ritroso la catena per evitare IP spoofati all'inizio
+    # 3. X-Forwarded-For: analizza a ritroso la catena saltando eventuali proxy fidati
     x_forwarded_for = request.headers.get("x-forwarded-for")
     if x_forwarded_for:
         parts = [p.strip() for p in x_forwarded_for.split(",") if p.strip()]
         for part in reversed(parts):
             valid_ip = _clean_ip(part)
+            if valid_ip and not _is_trusted_proxy(valid_ip):
+                return valid_ip
+        for part in reversed(parts):
+            valid_ip = _clean_ip(part)
             if valid_ip:
                 return valid_ip
 
-    # 4. Connessione TCP diretta
-    if request.client and request.client.host:
-        valid_client = _clean_ip(request.client.host)
-        if valid_client:
-            return valid_client
-
-    return "127.0.0.1"
+    # 4. Connessione TCP diretta dal proxy
+    return peer_ip or "127.0.0.1"
 
 _VOTER_TOKEN_RE = re.compile(r"^[a-zA-Z0-9_-]{16,64}$")
 _VOTE_RATE_LIMIT_LOCK = threading.Lock()
@@ -2278,6 +2593,7 @@ def record_community_vote(card_name: str, score: int, voter_hash: str):
     c = comm_conn.cursor()
     now = datetime.now().isoformat()
     try:
+        comm_conn.execute("BEGIN IMMEDIATE")
         prev = c.execute(
             "SELECT score FROM community_votes WHERE voter_hash = ? AND card_name = ?",
             (voter_hash, card_name)
@@ -2348,6 +2664,12 @@ def record_community_vote(card_name: str, score: int, voter_hash: str):
             },
             "daily_progress": _build_daily_progress(today_active_set, all_voted_set)
         }
+    except Exception:
+        try:
+            comm_conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         comm_conn.close()
 

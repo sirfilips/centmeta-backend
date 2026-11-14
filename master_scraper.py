@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 import logging
+import threading
 import requests
 from datetime import datetime
 
@@ -87,22 +88,34 @@ class ScraperProcessLock:
                 pass
             self.file_handle = None
 
-# Inizializza la sessione HTTP globale e lo stato del rate limiter
-session = requests.Session()
+# Inizializza lo stato del rate limiter e le sessioni HTTP thread-local
+_rate_limit_lock = threading.Lock()
+_thread_local = threading.local()
+_default_user_agent = ""
 last_request_time = 0.0
+
+def _get_http_session() -> requests.Session:
+    http_session = getattr(_thread_local, "http_session", None)
+    if http_session is None:
+        http_session = requests.Session()
+        _thread_local.http_session = http_session
+    if _default_user_agent and http_session.headers.get("User-Agent") != _default_user_agent:
+        http_session.headers.update({"User-Agent": _default_user_agent})
+    return http_session
 
 def rate_limited_get(url, params=None, headers=None, timeout=15):
     """
-    Esegue una richiesta GET garantendo che passino almeno 1.2 secondi
-    dall'inizio della richiesta precedente.
+    Esegue una richiesta GET garantendo in modo thread-safe che passino almeno
+    1.2 secondi dall'inizio della richiesta precedente.
     """
     global last_request_time
-    current_time = time.monotonic()
-    elapsed = current_time - last_request_time
-    if elapsed < 1.2:
-        time.sleep(1.2 - elapsed)
-    last_request_time = time.monotonic()
-    return session.get(url, params=params, headers=headers, timeout=timeout)
+    with _rate_limit_lock:
+        current_time = time.monotonic()
+        elapsed = current_time - last_request_time
+        if elapsed < 1.2:
+            time.sleep(1.2 - elapsed)
+        last_request_time = time.monotonic()
+    return _get_http_session().get(url, params=params, headers=headers, timeout=timeout)
 
 def normalize_partner_commander(cmd_name):
     """Normalizza e ordina alfabeticamente i nomi dei comandanti Partner (' / ')."""
@@ -259,6 +272,7 @@ def run_scraper() -> bool:
         return _run_scraper_locked()
 
 def _run_scraper_locked() -> bool:
+    global _default_user_agent
     # Verifica e impostazione dello User-Agent obbligatorio
     ua = os.environ.get("MOXFIELD_UA")
     if not ua:
@@ -266,7 +280,8 @@ def _run_scraper_locked() -> bool:
         return False
         
     ua = ua.strip()
-    session.headers.update({"User-Agent": ua})
+    _default_user_agent = ua
+    _get_http_session().headers.update({"User-Agent": ua})
     
     is_dry_run = os.environ.get("SCRAPER_DRY_RUN") == "1"
     
@@ -282,58 +297,58 @@ def _run_scraper_locked() -> bool:
             )
         else:
             logging.info(f"Trovato il file '{json_path}' e autorizzato ALLOW_JSON_IMPORT=1. Conversione diretta in SQLite in corso...")
-        import_success = False
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                database_pulito = json.load(f)
-
-            conn = sqlite3.connect(db_path, timeout=30)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA busy_timeout = 30000;")
+            import_success = False
             try:
-                cursor = conn.cursor()
-                cursor.execute("SELECT id_moxfield FROM blacklist")
-                blacklisted_ids = {row[0] for row in cursor.fetchall()}
-                
-                cursor.execute("DELETE FROM decks")
-                cursor.execute("DELETE FROM deck_cards")
-                
-                skipped_blacklist = 0
-                for mazzo in database_pulito:
-                    deck_id = mazzo.get("id_moxfield")
-                    if deck_id in blacklisted_ids:
-                        skipped_blacklist += 1
-                        continue
-                        
-                    cmd_name = normalize_partner_commander(mazzo.get("comandante", "Sconosciuto"))
-                    
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO decks (id_moxfield, comandante, data_aggiornamento) VALUES (?, ?, ?)",
-                        (deck_id, cmd_name, mazzo.get("data_aggiornamento"))
-                    )
-                    for carta in set(mazzo.get("carte", [])):
-                        cursor.execute("INSERT INTO deck_cards (deck_id, card_name) VALUES (?, ?)", (deck_id, carta))
-                        
-                cursor.execute("ANALYZE")
-                conn.commit()
-                import_success = True
-                logging.info(f"Conversione completata! {len(database_pulito) - skipped_blacklist} mazzi importati ({skipped_blacklist} ignorati per blacklist).")
-            except Exception as e:
-                conn.rollback()
-                raise e
-            finally:
-                conn.close()
-                
-            if import_success:
-                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                new_json_path = f"{json_path}.imported-{ts}"
+                with open(json_path, "r", encoding="utf-8") as f:
+                    database_pulito = json.load(f)
+
+                conn = sqlite3.connect(db_path, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout = 30000;")
                 try:
-                    os.replace(json_path, new_json_path)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id_moxfield FROM blacklist")
+                    blacklisted_ids = {row[0] for row in cursor.fetchall()}
+                    
+                    cursor.execute("DELETE FROM decks")
+                    cursor.execute("DELETE FROM deck_cards")
+                    
+                    skipped_blacklist = 0
+                    for mazzo in database_pulito:
+                        deck_id = mazzo.get("id_moxfield")
+                        if deck_id in blacklisted_ids:
+                            skipped_blacklist += 1
+                            continue
+                            
+                        cmd_name = normalize_partner_commander(mazzo.get("comandante", "Sconosciuto"))
+                        
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO decks (id_moxfield, comandante, data_aggiornamento) VALUES (?, ?, ?)",
+                            (deck_id, cmd_name, mazzo.get("data_aggiornamento"))
+                        )
+                        for carta in set(mazzo.get("carte", [])):
+                            cursor.execute("INSERT INTO deck_cards (deck_id, card_name) VALUES (?, ?)", (deck_id, carta))
+                            
+                    cursor.execute("ANALYZE")
+                    conn.commit()
+                    import_success = True
+                    logging.info(f"Conversione completata! {len(database_pulito) - skipped_blacklist} mazzi importati ({skipped_blacklist} ignorati per blacklist).")
                 except Exception as e:
-                    logging.error(f"Impossibile rinominare {json_path} post-import: {e}")
-                return True
-        except Exception as e:
-            logging.error(f"Errore nell'import JSON: {type(e).__name__} - {e}. Procedo con il download web...")
+                    conn.rollback()
+                    raise e
+                finally:
+                    conn.close()
+                    
+                if import_success:
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    new_json_path = f"{json_path}.imported-{ts}"
+                    try:
+                        os.replace(json_path, new_json_path)
+                    except Exception as e:
+                        logging.error(f"Impossibile rinominare {json_path} post-import: {e}")
+                    return True
+            except Exception as e:
+                logging.error(f"Errore nell'import JSON: {type(e).__name__} - {e}. Procedo con il download web...")
     elif os.path.exists(json_path) and is_dry_run:
         logging.info("Dry run: import del JSON saltato (il file verrà importato al prossimo run normale).")
 

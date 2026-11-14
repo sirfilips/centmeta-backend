@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   ci:
     name: Lint & Validation (Cloud)
@@ -34,6 +41,9 @@ jobs:
           python -m py_compile main.py master_scraper.py
           python -c "import main; print('FastAPI main module verified successfully')"
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
   deploy:
     name: Deploy to Production (Debian Runner)
     needs: ci
@@ -42,6 +52,7 @@ jobs:
     steps:
       - name: Pull changes and reload service
         run: |
+          set -euo pipefail
           echo "[Deploy] Acquisizione lock esclusivo per prevenire deploy concorrenti..."
           exec 200>/tmp/centmeta_deploy.lock
           flock 200
@@ -62,8 +73,10 @@ jobs:
           echo "[Deploy] Riavvio servizio CentMeta (centurionrec)..."
           if command -v sudo >/dev/null 2>&1; then
             sudo systemctl restart centurionrec.service
+            sudo systemctl is-active --quiet centurionrec.service
           else
             systemctl restart centurionrec.service
+            systemctl is-active --quiet centurionrec.service
           fi
           
           echo "[Deploy] Deploy completato con successo!"

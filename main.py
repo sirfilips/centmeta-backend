@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from pydantic import BaseModel, Field
 import master_scraper
+import scryfall_search
 
 try:
     from dotenv import load_dotenv
@@ -590,6 +591,22 @@ def _parse_scryfall_card_object(card: dict) -> dict:
     elif card.get("oracle_text"):
         oracles.append(card.get("oracle_text"))
 
+    faces = card.get("card_faces") or []
+    if "colors" in card and card.get("colors") is not None:
+        colors = list(card.get("colors") or [])
+    else:
+        seen_cols = []
+        for face in faces:
+            for col in (face.get("colors") or []):
+                if col not in seen_cols:
+                    seen_cols.append(col)
+        colors = seen_cols
+
+    mana_cost = card.get("mana_cost") or " // ".join(
+        f.get("mana_cost", "") for f in faces if f.get("mana_cost")
+    )
+    first_face = faces[0] if faces else {}
+
     return {
         "full_name": name,
         "images": images,
@@ -597,7 +614,14 @@ def _parse_scryfall_card_object(card: dict) -> dict:
         "oracles": oracles,
         "type": type_line,
         "color_identity": card.get("color_identity", []),
-        "cmc": card.get("cmc", 0.0)
+        "colors": colors,
+        "cmc": card.get("cmc", 0.0),
+        "mana_cost": mana_cost,
+        "keywords": card.get("keywords", []),
+        "power": card.get("power") if card.get("power") is not None else first_face.get("power"),
+        "toughness": card.get("toughness") if card.get("toughness") is not None else first_face.get("toughness"),
+        "loyalty": card.get("loyalty") if card.get("loyalty") is not None else first_face.get("loyalty"),
+        "rarity": card.get("rarity")
     }
 
 def _is_valid_cached_card(entry: Optional[dict]) -> bool:
@@ -871,6 +895,44 @@ def extract_commander_metadata(name: str, scryfall_cache: dict):
 
     return (is_valid and bool(parts)), images, art_crops, oracles, list(cmd_color_identity)
 
+def extract_commander_search_fields(name: str, scryfall_cache: dict) -> dict:
+    """Restituisce metadati aggiuntivi per ricerca Scryfall sui comandanti (type, cmc, keywords)."""
+    if not name or not name.strip():
+        return {"type": "", "cmc": 0.0, "keywords": [], "mana_cost": ""}
+    if " / " in name and " // " not in name:
+        parts = [p.strip() for p in name.split(" / ") if p.strip()]
+    else:
+        parts = [name.strip()]
+
+    types = []
+    cmcs = []
+    keywords = []
+    mana_costs = []
+    for part in parts:
+        info = lookup_card_info(scryfall_cache, part)
+        if not info and " // " in part:
+            for face_part in part.split(" // "):
+                info = lookup_card_info(scryfall_cache, face_part.strip())
+                if info:
+                    break
+        if info:
+            if info.get("type"):
+                types.append(info["type"])
+            if info.get("cmc") is not None:
+                cmcs.append(float(info["cmc"]))
+            if info.get("mana_cost"):
+                mana_costs.append(info["mana_cost"])
+            for kw in info.get("keywords", []) or []:
+                if kw not in keywords:
+                    keywords.append(kw)
+
+    return {
+        "type": " // ".join(types),
+        "cmc": max(cmcs) if cmcs else 0.0,
+        "keywords": keywords,
+        "mana_cost": " // ".join(mana_costs),
+    }
+
 def categorizza_tipo(type_line):
     t = type_line.lower()
     if "creature" in t: return "Creature"
@@ -1007,6 +1069,7 @@ def get_valid_commanders_set(filtro_tempo: str):
                     
         if is_valid:
             valid_set.add(name)
+            search_meta = extract_commander_search_fields(name, scryfall_cache)
             result_list.append({
                 "comandante": name,
                 "cnt": int(row['cnt']),
@@ -1014,7 +1077,11 @@ def get_valid_commanders_set(filtro_tempo: str):
                 "images": images,
                 "art_crops": art_crops,
                 "oracles": oracles,
-                "color_identity": cmd_color_identity
+                "color_identity": cmd_color_identity,
+                "type": search_meta["type"],
+                "cmc": search_meta["cmc"],
+                "keywords": search_meta["keywords"],
+                "mana_cost": search_meta["mana_cost"],
             })
             
     return frozenset(valid_set), result_list
@@ -1400,19 +1467,74 @@ def get_dashboard_data_cached(filtro_tempo: str):
             "icon_svg_uri": ""
         }
         expansion_raw_list.append((combined_exp_meta, all_exp_df, len(curr_all_exp_rows)))
+
+    # Calcolo sezioni per ruolo funzionale (Removal, Botti, Counterspell, Card Draw, ecc.)
+    scryfall_cache_roles = load_scryfall_cache()
+    card_roles_cache: Dict[str, List[str]] = {}
+
+    def _get_card_roles(c_name: str) -> List[str]:
+        cached_r = card_roles_cache.get(c_name)
+        if cached_r is not None:
+            return cached_r
+        info = lookup_card_info(scryfall_cache_roles, c_name)
+        r_list = scryfall_search.classify_card_roles(info)
+        card_roles_cache[c_name] = r_list
+        return r_list
+
+    role_curr_rows: Dict[str, List[Any]] = {r["key"]: [] for r in scryfall_search.ROLE_DEFINITIONS}
+    for r in curr_card_rows:
+        for role_key in _get_card_roles(r["card_name"]):
+            role_curr_rows[role_key].append(r)
+
+    role_prev_ranks: Dict[str, Dict[str, int]] = {r["key"]: {} for r in scryfall_search.ROLE_DEFINITIONS}
+    if prev_cond:
+        role_prev_counters: Dict[str, int] = {r["key"]: 0 for r in scryfall_search.ROLE_DEFINITIONS}
+        for r in prev_card_rows:
+            c_name = r["card_name"]
+            for role_key in _get_card_roles(c_name):
+                role_prev_counters[role_key] += 1
+                role_prev_ranks[role_key][c_name] = role_prev_counters[role_key]
+
+    role_raw_list = []
+    for role_meta in scryfall_search.ROLE_DEFINITIONS:
+        r_key = role_meta["key"]
+        curr_r = role_curr_rows[r_key]
+        prev_ranks_map = role_prev_ranks[r_key]
+        role_df = []
+        for idx, r in enumerate(curr_r[:25]):
+            c_name = r["card_name"]
+            if prev_cond:
+                trend = prev_ranks_map[c_name] - (idx + 1) if c_name in prev_ranks_map else None
+            else:
+                trend = ""
+            role_df.append({"card_name": c_name, "freq": r["freq"], "trend": trend})
+            all_names.add(c_name)
+        role_raw_list.append((role_meta, role_df, len(curr_r)))
     
     scryfall_cache = fetch_scryfall_data(list(all_names))
 
     def format_item(row, name_col, is_cmd=False):
         name = row[name_col]
         if is_cmd:
-            _, images, _, _, final_color_identity = extract_commander_metadata(name, scryfall_cache)
+            _, images, _, oracles, final_color_identity = extract_commander_metadata(name, scryfall_cache)
+            cmd_meta = extract_commander_search_fields(name, scryfall_cache)
             cat = "Comandante"
+            type_line = cmd_meta["type"]
+            cmc_val = cmd_meta["cmc"]
+            mana_cost_val = cmd_meta["mana_cost"]
+            keywords_val = cmd_meta["keywords"]
+            colors_val = final_color_identity
         else:
             main_info = lookup_card_info(scryfall_cache, name)
             images = list(dict.fromkeys(main_info.get("images", [])))
-            cat = categorizza_tipo(main_info.get("type", ""))
+            type_line = main_info.get("type", "")
+            cat = categorizza_tipo(type_line)
             final_color_identity = main_info.get("color_identity", [])
+            oracles = main_info.get("oracles", [])
+            cmc_val = main_info.get("cmc", 0.0)
+            mana_cost_val = main_info.get("mana_cost", "")
+            keywords_val = main_info.get("keywords", [])
+            colors_val = main_info.get("colors")
 
         t_val = row.get('trend')
         if t_val is None:
@@ -1420,16 +1542,28 @@ def get_dashboard_data_cached(filtro_tempo: str):
         else:
             trend_out = int(t_val) if t_val != "" else ""
 
-        return {
+        item_out = {
             "name": name,
             "images": images,
             "val1": int(row.get('cnt', row.get('freq', row.get('cnt1', 0)))),
             "trend": trend_out,
             "delta": int(row.get('delta', 0)) if 'delta' in row else None,
             "category": cat,
+            "type": type_line,
+            "cmc": cmc_val,
+            "oracles": oracles,
             "color_identity": final_color_identity,
             "set_code": row.get("set_code")
         }
+        if mana_cost_val:
+            item_out["mana_cost"] = mana_cost_val
+        if keywords_val:
+            item_out["keywords"] = keywords_val
+        if colors_val is not None:
+            item_out["colors"] = colors_val
+        if not is_cmd:
+            item_out["roles"] = _get_card_roles(name)
+        return item_out
 
     try:
         mtime = get_db_mtime()
@@ -1444,6 +1578,18 @@ def get_dashboard_data_cached(filtro_tempo: str):
         "hot_commanders": [format_item(row, 'comandante', True) for row in df_hot_cmd],
         "top_cards": [format_item(row, 'card_name', False) for row in df_top_cards],
         "hot_cards": [format_item(row, 'card_name', False) for row in df_hot_c],
+        "role_categories": [
+            {
+                "key": role_meta["key"],
+                "label": role_meta["label"],
+                "title": role_meta["title"],
+                "description": role_meta["description"],
+                "accent": role_meta["accent"],
+                "total_cards": total_role_cards,
+                "cards": [format_item(row, 'card_name', False) for row in role_df]
+            }
+            for role_meta, role_df, total_role_cards in role_raw_list
+        ],
         "recent_expansions": [
             {
                 "code": exp["code"],
@@ -1566,7 +1712,8 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
             if cmc >= 6: cmc = 6
             mana_curve[cmc] += avg_copies_comp
             
-        formatted_cards.append({
+        card_roles = scryfall_search.classify_card_roles(info)
+        card_entry = {
             "card_name": c_name,
             "freq": int(row['freq']),
             "Percentuale": float(row['Percentuale']),
@@ -1575,8 +1722,26 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
             "art_crops": info.get("art_crops", []),
             "oracles": info.get("oracles", []),
             "color_identity": info.get("color_identity", []),
-            "category": cat
-        })
+            "category": cat,
+            "type": type_line,
+            "cmc": info.get("cmc", 0.0),
+            "roles": card_roles
+        }
+        if info.get("mana_cost"):
+            card_entry["mana_cost"] = info["mana_cost"]
+        if info.get("colors") is not None:
+            card_entry["colors"] = info["colors"]
+        if info.get("keywords"):
+            card_entry["keywords"] = info["keywords"]
+        if info.get("power") is not None:
+            card_entry["power"] = info["power"]
+        if info.get("toughness") is not None:
+            card_entry["toughness"] = info["toughness"]
+        if info.get("loyalty") is not None:
+            card_entry["loyalty"] = info["loyalty"]
+        if info.get("rarity"):
+            card_entry["rarity"] = info["rarity"]
+        formatted_cards.append(card_entry)
         
     is_partner_cmd = bool(comandante and " / " in comandante and " // " not in comandante)
     expected_mainboard = 98.0 if is_partner_cmd else 99.0
@@ -2707,20 +2872,26 @@ def get_community_leaderboard(
             """
             rows = c.execute(query, (min_votes, limit, offset)).fetchall()
         else:
-            where_sql = "WHERE total_votes >= ?"
-            params: list = [min_votes]
-            if search_clean:
-                where_sql += " AND LOWER(card_name) LIKE ?"
-                params.append(f"%{search_clean}%")
             query = f"""
                 SELECT card_name, total_votes, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5, last_voted_at
                 FROM community_ratings
-                {where_sql}
+                WHERE total_votes >= ?
                 {order_clause}
             """
-            all_matching_rows = c.execute(query, params).fetchall()
+            all_matching_rows = c.execute(query, (min_votes,)).fetchall()
+            scryfall_cache_filter = load_scryfall_cache()
+
+            if search_clean:
+                search_predicate = scryfall_search.compile_scryfall_query((search or "").strip())
+                search_filtered = []
+                for r in all_matching_rows:
+                    info = lookup_card_info(scryfall_cache_filter, r['card_name']) or {}
+                    card_obj = {"card_name": r['card_name'], **info}
+                    if search_predicate(card_obj):
+                        search_filtered.append(r)
+                all_matching_rows = search_filtered
+
             if active_colors:
-                scryfall_cache_filter = load_scryfall_cache()
                 filtered_rows = []
                 base_colors = [col for col in active_colors if col not in ("C", "M")]
                 wants_c = "C" in active_colors

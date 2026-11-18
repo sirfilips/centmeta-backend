@@ -393,6 +393,32 @@ class TestRoleClassificationAndScryfallSearch(unittest.TestCase):
             ["Kraum, Ludevic's Opus / Tymna the Weaver"],
         )
 
+        # commander: / cmd: seguono le stesse regole di id: (color_identity <= target)
+        p6 = scryfall_search.compile_scryfall_query("(commander:jund)")
+        self.assertEqual([c["card_name"] for c in cards if p6(c)], ["Lightning Bolt"])
+
+        p7 = scryfall_search.compile_scryfall_query("cmd:izzet -t:creature")
+        self.assertEqual(
+            [c["card_name"] for c in cards if p7(c)],
+            ["Lightning Bolt", "Counterspell"],
+        )
+
+        # Verifica che (id:jund) non lasci passare carte con colori fuori B/R/G (es. W o U)
+        p8 = scryfall_search.compile_scryfall_query("(id:jund)")
+        self.assertEqual([c["card_name"] for c in cards if p8(c)], ["Lightning Bolt"])
+
+        # Verifica che -is:fetchland escluda le fetchland incolori quando richiesto
+        fetch_card = {
+            "card_name": "Flooded Strand",
+            "type": "Land",
+            "oracles": ["{T}, Pay 1 life, Sacrifice this land: Search your library for a Plains or Island card, put it onto the battlefield, then shuffle."],
+            "color_identity": [],
+            "cmc": 0.0,
+        }
+        p9 = scryfall_search.compile_scryfall_query("commander:jund -is:fetchland")
+        self.assertFalse(p9(fetch_card))
+        self.assertTrue(p8(fetch_card))
+
         # Malformed / unclosed queries must never raise
         for bad_q in ["(((", 'o:"unclosed', "o:/[invalid/", "-", "t:"]:
             pred = scryfall_search.compile_scryfall_query(bad_q)

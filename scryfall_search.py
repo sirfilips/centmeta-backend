@@ -300,7 +300,7 @@ _KNOWN_FIELDS = {
     "o", "oracle", "fo", "fulloracle",
     "t", "type",
     "c", "color", "colors",
-    "id", "identity", "ci",
+    "id", "identity", "ci", "commander", "cmd",
     "mv", "cmc", "manavalue",
     "m", "mana",
     "kw", "keyword",
@@ -314,6 +314,17 @@ _KNOWN_FIELDS = {
     "role", "function", "otag",
     "decks", "freq", "perc", "sinergia",
 }
+
+_STAT_FIELD_MAP = {
+    "pow": "power",
+    "power": "power",
+    "tou": "toughness",
+    "toughness": "toughness",
+    "loy": "loyalty",
+    "loyalty": "loyalty",
+}
+
+_VALID_COLOR_SET = {"W", "U", "B", "R", "G"}
 
 _FIELD_OP_RE = re.compile(r"^([a-zA-Z]+)(!=|<=|>=|:|=|<|>)(.*)$", re.DOTALL)
 
@@ -440,77 +451,92 @@ def _parse_color_expr(val: str) -> Tuple[Optional[int], Optional[str], Set[str]]
     return None, None, letters
 
 
-def _compare_numeric(actual: Optional[float], op: str, target_str: str) -> bool:
+def _compile_numeric_comparator(op: str, target_str: str) -> Callable[[Optional[float]], bool]:
+    """Pre-compila il confronto numerico evitando parsing ripetuto per ogni carta."""
     t = _strip_quotes(target_str).strip().lower()
-    if actual is None:
-        return False
     if t == "even":
-        return int(actual) % 2 == 0 if float(actual).is_integer() else False
+        return lambda actual: actual is not None and float(actual).is_integer() and int(actual) % 2 == 0
     if t == "odd":
-        return int(actual) % 2 == 1 if float(actual).is_integer() else False
+        return lambda actual: actual is not None and float(actual).is_integer() and int(actual) % 2 == 1
     try:
         target = float(t)
     except ValueError:
-        return False
+        return lambda _actual: False
+
     if op in (":", "="):
-        return actual == target
+        return lambda actual: actual is not None and actual == target
     if op == "!=":
-        return actual != target
+        return lambda actual: actual is not None and actual != target
     if op == "<":
-        return actual < target
+        return lambda actual: actual is not None and actual < target
     if op == "<=":
-        return actual <= target
+        return lambda actual: actual is not None and actual <= target
     if op == ">":
-        return actual > target
+        return lambda actual: actual is not None and actual > target
     if op == ">=":
-        return actual >= target
-    return False
+        return lambda actual: actual is not None and actual >= target
+    return lambda _actual: False
 
 
-def _compare_color_set(actual_list: List[str], op: str, val: str, is_identity: bool) -> bool:
-    actual = {c.upper() for c in (actual_list or []) if c and c.upper() in ("W", "U", "B", "R", "G")}
+def _compile_color_comparator(op: str, val: str, is_identity: bool) -> Callable[[Optional[List[str]]], bool]:
+    """Pre-compila il confronto colore/identità per valutare migliaia di carte a costo minimo."""
     num_count, special, target = _parse_color_expr(val)
 
     if num_count is not None:
-        return _compare_numeric(float(len(actual)), op, str(num_count))
+        num_cmp = _compile_numeric_comparator(op, str(num_count))
+        return lambda actual_list: num_cmp(
+            float(sum(1 for c in (actual_list or []) if c and c.upper() in _VALID_COLOR_SET))
+        )
+
     if special == "c":
-        is_c = len(actual) == 0
-        return (not is_c) if op == "!=" else is_c
+        want_not = op == "!="
+        def _c_pred(actual_list: Optional[List[str]]) -> bool:
+            has_color = any(c and c.upper() in _VALID_COLOR_SET for c in (actual_list or []))
+            return has_color if want_not else (not has_color)
+        return _c_pred
+
     if special == "m":
-        is_m = len(actual) > 1
-        return (not is_m) if op == "!=" else is_m
+        want_not = op == "!="
+        def _m_pred(actual_list: Optional[List[str]]) -> bool:
+            cnt = len({c.upper() for c in (actual_list or []) if c and c.upper() in _VALID_COLOR_SET})
+            is_m = cnt > 1
+            return (not is_m) if want_not else is_m
+        return _m_pred
+
     if not target:
-        return False
+        return lambda _actual_list: False
 
-    if op == "=":
-        return actual == target
-    if op == "!=":
-        return actual != target
-    if op == "<=":
-        return actual.issubset(target)
-    if op == "<":
-        return actual.issubset(target) and actual != target
-    if op == ">=":
-        return target.issubset(actual)
-    if op == ">":
-        return target.issubset(actual) and actual != target
-    # Operatore ':' -> per id: in Scryfall significa <= (rientra nell'identità), per c: significa >= (contiene quei colori)
-    if is_identity:
-        return actual.issubset(target)
-    return target.issubset(actual)
+    def _set_pred(actual_list: Optional[List[str]]) -> bool:
+        actual = {c.upper() for c in (actual_list or []) if c and c.upper() in _VALID_COLOR_SET}
+        if op == "=":
+            return actual == target
+        if op == "!=":
+            return actual != target
+        if op == "<=":
+            return actual.issubset(target)
+        if op == "<":
+            return actual.issubset(target) and actual != target
+        if op == ">=":
+            return target.issubset(actual)
+        if op == ">":
+            return target.issubset(actual) and actual != target
+        # Operatore ':' -> id:/commander: significa <= (rientra nell'identità), c: significa >=
+        return actual.issubset(target) if is_identity else target.issubset(actual)
+
+    return _set_pred
 
 
-def _match_text(text: str, raw_val: str, exact: bool = False) -> bool:
+def _compile_text_matcher(raw_val: str, exact: bool = False) -> Callable[[str], bool]:
+    """Pre-compila regex o sottostringa lowercase per ricerche testuali rapide."""
     regex = _parse_regex_literal(raw_val)
     if regex is not None:
-        return bool(regex.search(text))
+        return lambda text: bool(regex.search(text))
     needle = _strip_quotes(raw_val).strip().lower()
     if not needle:
-        return True
-    hay = text.lower()
+        return lambda _text: True
     if exact:
-        return hay == needle
-    return needle in hay
+        return lambda text: text.lower() == needle
+    return lambda text: needle in text.lower()
 
 
 def _normalize_mana_query(raw_val: str) -> str:
@@ -584,12 +610,16 @@ def _match_is_property(card: Dict[str, Any], prop: str) -> bool:
     return False
 
 
+def _get_item_name(card: Dict[str, Any]) -> str:
+    return card.get("name") or card.get("card_name") or card.get("comandante") or ""
+
+
 def _build_term_predicate(term: str) -> Callable[[Dict[str, Any]], bool]:
     # Gestione prefisso esatto '!'
     if term.startswith("!"):
         target = _strip_quotes(term[1:]).strip().lower()
         def _exact_pred(card: Dict[str, Any]) -> bool:
-            name = (card.get("name") or card.get("card_name") or card.get("comandante") or "").strip().lower()
+            name = _get_item_name(card).strip().lower()
             if name == target:
                 return True
             if " // " in name:
@@ -604,54 +634,62 @@ def _build_term_predicate(term: str) -> Callable[[Dict[str, Any]], bool]:
         val = m.group(3)
         if field in _KNOWN_FIELDS:
             if field in ("o", "oracle", "fo", "fulloracle"):
+                base_matcher = _compile_text_matcher(val)
+                has_tilde = "~" in val
                 def _oracle_pred(card: Dict[str, Any]) -> bool:
                     oracles_str = "\n".join(card.get("oracles") or [])
                     if not oracles_str:
                         return False
-                    name = card.get("name") or card.get("card_name") or card.get("comandante") or ""
-                    clean_val = val.replace("~", name) if "~" in val and name else val
-                    return _match_text(oracles_str, clean_val) or _match_text(oracles_str, val)
+                    if base_matcher(oracles_str):
+                        return True
+                    if has_tilde:
+                        name = _get_item_name(card)
+                        if name:
+                            return _compile_text_matcher(val.replace("~", name))(oracles_str)
+                    return False
                 return _oracle_pred
 
             if field in ("t", "type"):
-                return lambda card: _match_text(card.get("type") or "", val)
+                type_matcher = _compile_text_matcher(val)
+                return lambda card: type_matcher(card.get("type") or "")
 
             if field in ("n", "name"):
-                def _name_pred(card: Dict[str, Any]) -> bool:
-                    name = card.get("name") or card.get("card_name") or card.get("comandante") or ""
-                    return _match_text(name, val, exact=(op == "="))
-                return _name_pred
+                name_matcher = _compile_text_matcher(val, exact=(op == "="))
+                return lambda card: name_matcher(_get_item_name(card))
 
-            if field in ("id", "identity", "ci"):
-                return lambda card: _compare_color_set(card.get("color_identity") or [], op, val, is_identity=True)
+            if field in ("id", "identity", "ci", "commander", "cmd"):
+                id_cmp = _compile_color_comparator(op, val, is_identity=True)
+                return lambda card: id_cmp(card.get("color_identity") or [])
 
             if field in ("c", "color", "colors"):
+                color_cmp = _compile_color_comparator(op, val, is_identity=False)
                 def _color_pred(card: Dict[str, Any]) -> bool:
                     colors = card.get("colors")
                     if colors is None:
                         t_front = (card.get("type") or "").lower().split(" // ")[0]
                         colors = [] if "land" in t_front else (card.get("color_identity") or [])
-                    return _compare_color_set(colors, op, val, is_identity=False)
+                    return color_cmp(colors)
                 return _color_pred
 
             if field in ("mv", "cmc", "manavalue"):
+                cmc_cmp = _compile_numeric_comparator(op, val)
                 def _cmc_pred(card: Dict[str, Any]) -> bool:
                     raw = card.get("cmc")
-                    if raw is None:
-                        return False
-                    return _compare_numeric(float(raw), op, val)
+                    return False if raw is None else cmc_cmp(float(raw))
                 return _cmc_pred
 
-            if field in ("pow", "power", "tou", "toughness", "loy", "loyalty"):
-                key = {"pow": "power", "power": "power", "tou": "toughness", "toughness": "toughness", "loy": "loyalty", "loyalty": "loyalty"}[field]
+            if field in _STAT_FIELD_MAP:
+                key = _STAT_FIELD_MAP[field]
+                stat_cmp = _compile_numeric_comparator(op, val)
+                val_lower = _strip_quotes(val).strip().lower()
                 def _stat_pred(card: Dict[str, Any]) -> bool:
                     raw = card.get(key)
                     if raw is None or raw == "":
                         return False
                     try:
-                        return _compare_numeric(float(raw), op, val)
+                        return stat_cmp(float(raw))
                     except (TypeError, ValueError):
-                        return _strip_quotes(val).strip().lower() == str(raw).strip().lower()
+                        return val_lower == str(raw).strip().lower()
                 return _stat_pred
 
             if field in ("m", "mana"):
@@ -660,21 +698,21 @@ def _build_term_predicate(term: str) -> Callable[[Dict[str, Any]], bool]:
                     mc = (card.get("mana_cost") or "").upper()
                     if not mc:
                         return False
-                    if op == "=":
-                        return mc == norm_q
-                    return norm_q in mc
+                    return mc == norm_q if op == "=" else norm_q in mc
                 return _mana_pred
 
             if field in ("kw", "keyword"):
                 kw_needle = _strip_quotes(val).strip().lower()
+                kw_regex = re.compile(rf"(?:^|[\n,])\s*{re.escape(kw_needle)}\b", re.IGNORECASE) if kw_needle else None
                 def _kw_pred(card: Dict[str, Any]) -> bool:
                     if not kw_needle:
                         return True
-                    kws = [k.lower() for k in (card.get("keywords") or [])]
-                    if any(kw_needle == k or kw_needle in k for k in kws):
+                    kws = card.get("keywords") or []
+                    if any(kw_needle in k.lower() for k in kws):
                         return True
-                    oracles_str = "\n".join(card.get("oracles") or []).lower()
-                    return bool(re.search(rf"(?:^|[\n,])\s*{re.escape(kw_needle)}\b", oracles_str))
+                    if not kw_regex:
+                        return False
+                    return bool(kw_regex.search("\n".join(card.get("oracles") or [])))
                 return _kw_pred
 
             if field in ("e", "set", "s"):
@@ -685,14 +723,14 @@ def _build_term_predicate(term: str) -> Callable[[Dict[str, Any]], bool]:
                 return _set_pred
 
             if field in ("r", "rarity"):
-                r_target = RARITY_ALIASES.get(_strip_quotes(val).strip().lower(), _strip_quotes(val).strip().lower())
+                raw_r = _strip_quotes(val).strip().lower()
+                r_target = RARITY_ALIASES.get(raw_r, raw_r)
                 return lambda card: (card.get("rarity") or "").strip().lower() == r_target
 
-            if field == "is":
-                return lambda card: _match_is_property(card, val)
-
-            if field == "not":
-                return lambda card: not _match_is_property(card, val)
+            if field in ("is", "not"):
+                prop_clean = _strip_quotes(val).strip().lower()
+                negate = field == "not"
+                return (lambda card: not _match_is_property(card, prop_clean)) if negate else (lambda card: _match_is_property(card, prop_clean))
 
             if field in ("role", "function", "otag"):
                 canonical = ROLE_ALIASES.get(_strip_quotes(val).strip().lower())
@@ -706,6 +744,7 @@ def _build_term_predicate(term: str) -> Callable[[Dict[str, Any]], bool]:
                 return _role_pred
 
             if field in ("decks", "freq", "perc", "sinergia"):
+                metric_cmp = _compile_numeric_comparator(op, val)
                 def _metric_pred(card: Dict[str, Any]) -> bool:
                     if field == "perc":
                         raw = card.get("Percentuale")
@@ -713,17 +752,12 @@ def _build_term_predicate(term: str) -> Callable[[Dict[str, Any]], bool]:
                         raw = card.get("Sinergia")
                     else:
                         raw = card.get("freq") or card.get("cnt") or card.get("val1")
-                    if raw is None:
-                        return False
-                    return _compare_numeric(float(raw), op, val)
+                    return False if raw is None else metric_cmp(float(raw))
                 return _metric_pred
 
     # Ricerca testuale semplice sul nome della carta/comandante
-    def _plain_pred(card: Dict[str, Any]) -> bool:
-        name = card.get("name") or card.get("card_name") or card.get("comandante") or ""
-        return _match_text(name, term)
-
-    return _plain_pred
+    plain_matcher = _compile_text_matcher(term)
+    return lambda card: plain_matcher(_get_item_name(card))
 
 
 def compile_scryfall_query(query: str) -> Callable[[Dict[str, Any]], bool]:
@@ -798,11 +832,6 @@ def compile_scryfall_query(query: str) -> Callable[[Dict[str, Any]], bool]:
             if val == "-":
                 sub = parse_unary()
                 return lambda c, s=sub: not s(c)
-            if val.startswith("-(") or (val == "-" and peek() and peek()[0] == "LPAREN"):
-                inner = parse_or()
-                if peek() and peek()[0] == "RPAREN":
-                    consume()
-                return lambda c, fn=inner: not fn(c)
             if val.startswith("-") and len(val) > 1:
                 inner = _build_term_predicate(val[1:])
                 return lambda c, fn=inner: not fn(c)
@@ -811,15 +840,5 @@ def compile_scryfall_query(query: str) -> Callable[[Dict[str, Any]], bool]:
         # Fallback per eventuali token inattesi
         consume()
         return lambda _c: True
-
-    # Supporto esplicito per '-(' attaccato nei token
-    normalized_tokens: List[Tuple[str, str]] = []
-    for kind, val in tokens:
-        if kind == "TERM" and val == "-":
-            normalized_tokens.append(("TERM", "-"))
-        else:
-            normalized_tokens.append((kind, val))
-    tokens = normalized_tokens
-    total = len(tokens)
 
     return parse_or()

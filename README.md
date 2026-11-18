@@ -57,14 +57,16 @@ cd centmeta-backend
 python3 -m venv venv
 source venv/bin/activate
 
-# Su sistemi Windows:
+# Su sistemi Windows (CMD / PowerShell):
 python -m venv venv
-venv\Scripts\activate
+venv\Scripts\activate        # CMD
+.\venv\Scripts\Activate.ps1  # PowerShell
 ```
 
-4. Installare le dipendenze:
+4. Aggiornare `pip` e installare le dipendenze dal `requirements.txt`:
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 5. Configurare le variabili d'ambiente:
@@ -89,6 +91,8 @@ Le API saranno disponibili all'indirizzo `http://localhost:8000`. La documentazi
 
 *   `/main.py`: Core dell'applicazione, definizione degli endpoint API, logica di calcolo statistico e gestione delle cache.
 *   `/master_scraper.py`: Script indipendente per il fetch massivo e il parsing dei deck data, con logica di salvataggio diretto in SQLite.
+*   `/scryfall_search.py`: Parser e motore di query compatibile con la sintassi Scryfall (operatori booleani, ruoli funzionali, `id:`, `commander:`, ecc.).
+*   `/tests/`: Suite di unit test backend (`unittest`).
 *   `centurion.db`: (Non versionato) Database SQLite locale generato dinamicamente.
 *   `scryfall_cache.json`: (Non versionato) Cache locale per ottimizzare il traffico di rete verso le API di Scryfall.
 

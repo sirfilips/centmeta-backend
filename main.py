@@ -1,7 +1,9 @@
 import os
 import re
+import gzip
 import json
 import sqlite3
+import tempfile
 import requests
 import asyncio
 import ipaddress
@@ -118,8 +120,8 @@ _scryfall_rate_lock = threading.Lock()
 _scryfall_last_request_ts = 0.0
 _SCRYFALL_MISSING_CACHE = set()
 
-def _wait_scryfall_rate_limit(min_interval: float = 0.11):
-    """Garantisce almeno min_interval secondi tra richieste consecutive verso Scryfall."""
+def _wait_scryfall_rate_limit(min_interval: float = 0.55):
+    """Garantisce almeno min_interval secondi tra richieste consecutive verso Scryfall (limite 2 req/s su /cards/*)."""
     global _scryfall_last_request_ts
     with _scryfall_rate_lock:
         now = std_time.monotonic()
@@ -232,6 +234,7 @@ def setup_community_db():
         ''')
         c.execute("CREATE INDEX IF NOT EXISTS idx_community_votes_voter ON community_votes(voter_hash)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_community_votes_card ON community_votes(card_name)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_community_votes_created_at ON community_votes(created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_community_ratings_avg ON community_ratings(avg_score DESC, total_votes DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_community_ratings_votes ON community_ratings(total_votes DESC)")
         conn.commit()
@@ -290,11 +293,15 @@ def _perform_health_pings():
         # 1. Ping Scryfall (salta se già eseguito negli ultimi 45 minuti da un altro worker)
         scry_sec = _get_last_ping_seconds_ago(c, "scryfall")
         if scry_sec is None or scry_sec >= 2700:
+            def _ping_scryfall():
+                _wait_scryfall_rate_limit()
+                return get_scryfall_session().get("https://api.scryfall.com/cards/named?exact=Sol Ring", timeout=10)
+
             _record_service_ping(
                 c,
                 now,
                 "scryfall",
-                lambda: get_scryfall_session().get("https://api.scryfall.com/cards/named?exact=Sol Ring", timeout=10)
+                _ping_scryfall
             )
         
         # 2. Ping Moxfield (rispetta rigidamente il rate limiter di 1.2s condiviso con lo scraper)
@@ -364,6 +371,11 @@ async def background_db_updater():
             await asyncio.sleep(seconds_to_wait)
             print("[CRON] Avvio aggiornamento giornaliero del database...")
             
+            try:
+                await run_in_threadpool(cleanup_expired_community_votes)
+            except Exception as cleanup_err:
+                logging.error(f"[COMMUNITY DB] Errore pulizia voti scaduti: {cleanup_err}")
+
             scraped = await run_in_threadpool(master_scraper.run_scraper)
             if scraped:
                 clear_all_caches()
@@ -382,6 +394,7 @@ CARTELLA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(CARTELLA_SCRIPT, "centurion.db")
 HEALTH_DB_PATH = os.path.join(CARTELLA_SCRIPT, "health.db")
 COMMUNITY_DB_PATH = os.path.join(CARTELLA_SCRIPT, "community.db")
+COMMUNITY_VOTES_RETENTION_DAYS = 365
 CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_cache.json")
 SETS_CACHE_FILE = os.path.join(CARTELLA_SCRIPT, "scryfall_sets_cache.json")
 _EXPANSIONS_CACHE_MEMORY = None
@@ -439,6 +452,7 @@ async def lifespan(app: FastAPI):
     setup_health_db(init_main_blacklist=True)
     setup_community_db()
     cleanup_lands_from_community_db()
+    cleanup_expired_community_votes()
     sanitize_commanders_in_db()
     setup_database_indices()
 
@@ -462,11 +476,13 @@ async def lifespan(app: FastAPI):
         await warmup_caches(["Ultimi 30 giorni"])
 
     warmup_task = asyncio.create_task(deferred_warmup())
+    artist_backfill_task = asyncio.create_task(background_scryfall_artist_backfill())
 
     yield  # <-- Il server apre la porta ORA ed è subito accessibile
 
     if warmup_task:
         warmup_task.cancel()
+    artist_backfill_task.cancel()
     updater_task.cancel()
     health_task.cancel()
 
@@ -606,6 +622,7 @@ def _parse_scryfall_card_object(card: dict) -> dict:
         f.get("mana_cost", "") for f in faces if f.get("mana_cost")
     )
     first_face = faces[0] if faces else {}
+    artist = (card.get("artist") or first_face.get("artist") or "").strip()
 
     return {
         "full_name": name,
@@ -621,7 +638,8 @@ def _parse_scryfall_card_object(card: dict) -> dict:
         "power": card.get("power") if card.get("power") is not None else first_face.get("power"),
         "toughness": card.get("toughness") if card.get("toughness") is not None else first_face.get("toughness"),
         "loyalty": card.get("loyalty") if card.get("loyalty") is not None else first_face.get("loyalty"),
-        "rarity": card.get("rarity")
+        "rarity": card.get("rarity"),
+        "artist": artist
     }
 
 def _is_valid_cached_card(entry: Optional[dict]) -> bool:
@@ -630,6 +648,292 @@ def _is_valid_cached_card(entry: Optional[dict]) -> bool:
     if entry.get("type") in ("Card", " Card // Card"):
         return False
     return True
+
+_SCRYFALL_UUID_RE = re.compile(
+    r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.[a-z]+",
+    re.IGNORECASE,
+)
+
+def _extract_scryfall_id_from_entry(entry: dict) -> Optional[str]:
+    for url in (entry.get("art_crops") or []) + (entry.get("images") or []):
+        if isinstance(url, str):
+            m = _SCRYFALL_UUID_RE.search(url)
+            if m:
+                return m.group(1).lower()
+    return None
+
+def collect_missing_artist_targets() -> List[tuple[dict, List[str]]]:
+    cache = load_scryfall_cache()
+    priority_keys: set[str] = set()
+    if os.path.exists(COMMUNITY_DB_PATH):
+        comm_conn = None
+        try:
+            comm_conn = get_community_db()
+            rows = comm_conn.execute("SELECT card_name FROM community_ratings").fetchall()
+            for r in rows:
+                cn = (r["card_name"] or "").strip().lower()
+                if cn:
+                    priority_keys.add(cn)
+                    if " // " in cn:
+                        priority_keys.add(cn.split(" // ")[0].strip())
+        except Exception:
+            pass
+        finally:
+            if comm_conn is not None:
+                comm_conn.close()
+
+    grouped: Dict[tuple[str, str], tuple[dict, List[str], bool]] = {}
+    for k, entry in cache.items():
+        if not _is_valid_cached_card(entry) or (entry.get("artist") or "").strip():
+            continue
+        uuid_val = _extract_scryfall_id_from_entry(entry)
+        if uuid_val:
+            g_key = ("id", uuid_val)
+            ident = {"id": uuid_val}
+        else:
+            name_val = (entry.get("full_name") or k).strip()
+            if not name_val:
+                continue
+            g_key = ("name", name_val.lower())
+            ident = {"name": name_val}
+        is_prio = k in priority_keys
+        if g_key not in grouped:
+            grouped[g_key] = (ident, [k], is_prio)
+        else:
+            existing_ident, keys_list, prev_prio = grouped[g_key]
+            keys_list.append(k)
+            grouped[g_key] = (existing_ident, keys_list, prev_prio or is_prio)
+
+    prio_targets: List[tuple[dict, List[str]]] = []
+    other_targets: List[tuple[dict, List[str]]] = []
+    for ident, keys_list, is_prio in grouped.values():
+        if is_prio:
+            prio_targets.append((ident, keys_list))
+        else:
+            other_targets.append((ident, keys_list))
+    return prio_targets + other_targets
+
+SCRYFALL_BULK_BACKFILL_THRESHOLD = 75
+
+def _extract_artist_from_scryfall_card(card: dict) -> str:
+    faces_list = card.get("card_faces") or []
+    first_face_matched = faces_list[0] if faces_list else {}
+    return (card.get("artist") or first_face_matched.get("artist") or "").strip()
+
+def backfill_scryfall_artists_batch(batch: List[tuple[dict, List[str]]]) -> tuple[Dict[str, dict], bool]:
+    if not batch:
+        return {}, False
+    session = get_scryfall_session()
+    identifiers = [ident for ident, _ in batch]
+    try:
+        _wait_scryfall_rate_limit()
+        res = session.post(
+            "https://api.scryfall.com/cards/collection",
+            json={"identifiers": identifiers},
+            timeout=15,
+        )
+        if res.status_code in (429, 403):
+            logging.warning(f"[SCRYFALL BACKFILL] Ricevuto HTTP {res.status_code}; interrompo il backfill artisti.")
+            return {}, True
+        if res.status_code != 200:
+            return {}, False
+        body = res.json()
+    except Exception as e:
+        logging.warning(f"[SCRYFALL BACKFILL] Errore batch Scryfall: {e}")
+        return {}, False
+
+    by_id: Dict[str, dict] = {}
+    by_name: Dict[str, dict] = {}
+    for card in body.get("data", []):
+        cid = (card.get("id") or "").strip().lower()
+        if cid:
+            by_id[cid] = card
+        cname = (card.get("name") or "").strip().lower()
+        if cname:
+            by_name[cname] = card
+            if " // " in cname:
+                by_name.setdefault(cname.split(" // ")[0].strip(), card)
+
+    cache_snapshot = load_scryfall_cache()
+    updates: Dict[str, dict] = {}
+    for ident, keys_list in batch:
+        matched = None
+        if "id" in ident:
+            matched = by_id.get(ident["id"].lower())
+        if matched is None and "name" in ident:
+            matched = by_name.get(ident["name"].lower())
+        if not matched:
+            continue
+        artist = _extract_artist_from_scryfall_card(matched)
+        if not artist:
+            continue
+        for ck in keys_list:
+            existing = cache_snapshot.get(ck)
+            if isinstance(existing, dict):
+                updates[ck] = {**existing, "artist": artist}
+    return updates, False
+
+def backfill_scryfall_artists_from_bulk(targets: List[tuple[dict, List[str]]]) -> Dict[str, dict]:
+    if not targets:
+        return {}
+
+    needed_ids: Dict[str, List[str]] = {}
+    needed_names: Dict[str, List[str]] = {}
+    for ident, keys_list in targets:
+        if "id" in ident and ident["id"]:
+            needed_ids[ident["id"].lower()] = keys_list
+        elif "name" in ident and ident["name"]:
+            needed_names[ident["name"].lower()] = keys_list
+
+    if not needed_ids and not needed_names:
+        return {}
+
+    session = get_scryfall_session()
+    try:
+        _wait_scryfall_rate_limit()
+        meta_res = session.get("https://api.scryfall.com/bulk-data/default-cards", timeout=15)
+        if meta_res.status_code != 200:
+            logging.warning(f"[SCRYFALL BULK] HTTP {meta_res.status_code} su /bulk-data/default-cards")
+            return {}
+        meta = meta_res.json()
+        download_url = meta.get("jsonl_download_uri") or meta.get("download_uri")
+        if not download_url:
+            logging.warning("[SCRYFALL BULK] URL di download non trovato nei metadati bulk-data.")
+            return {}
+
+        matched_artists: Dict[str, str] = {}
+
+        def _process_card_obj(card: dict):
+            artist = _extract_artist_from_scryfall_card(card)
+            if not artist:
+                return
+            cid = (card.get("id") or "").strip().lower()
+            if cid and cid in needed_ids:
+                for ck in needed_ids.pop(cid):
+                    matched_artists[ck] = artist
+            if needed_names:
+                cname = (card.get("name") or "").strip().lower()
+                if cname in needed_names:
+                    for ck in needed_names.pop(cname):
+                        matched_artists.setdefault(ck, artist)
+                elif " // " in cname:
+                    front = cname.split(" // ")[0].strip()
+                    if front in needed_names:
+                        for ck in needed_names.pop(front):
+                            matched_artists.setdefault(ck, artist)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = os.path.join(tmpdir, "default_cards.dat")
+            with session.get(download_url, stream=True, timeout=120) as dl_res:
+                if dl_res.status_code != 200:
+                    logging.warning(f"[SCRYFALL BULK] HTTP {dl_res.status_code} durante il download bulk.")
+                    return {}
+                with open(tmp_path, "wb") as f_out:
+                    for chunk in dl_res.iter_content(chunk_size=65536):
+                        if chunk:
+                            f_out.write(chunk)
+
+            with open(tmp_path, "rb") as f_head:
+                magic = f_head.read(2)
+            is_gzip = download_url.lower().endswith(".gz") or magic == b"\x1f\x8b"
+            opener = gzip.open if is_gzip else open
+
+            with opener(tmp_path, "rt", encoding="utf-8") as f_in:
+                first_char = ""
+                while True:
+                    ch = f_in.read(1)
+                    if not ch:
+                        break
+                    if not ch.isspace():
+                        first_char = ch
+                        break
+                f_in.seek(0)
+
+                if first_char == "[":
+                    for card in json.load(f_in):
+                        if isinstance(card, dict):
+                            _process_card_obj(card)
+                            if not needed_ids and not needed_names:
+                                break
+                else:
+                    for line in f_in:
+                        s_line = line.strip()
+                        if not s_line:
+                            continue
+                        card = json.loads(s_line)
+                        if isinstance(card, dict):
+                            _process_card_obj(card)
+                            if not needed_ids and not needed_names:
+                                break
+    except Exception as e:
+        logging.warning(f"[SCRYFALL BULK] Errore durante il backfill da Bulk Data: {e}")
+        return {}
+
+    if not matched_artists:
+        return {}
+
+    cache_snapshot = load_scryfall_cache()
+    updates: Dict[str, dict] = {}
+    for ck, artist in matched_artists.items():
+        existing = cache_snapshot.get(ck)
+        if isinstance(existing, dict):
+            updates[ck] = {**existing, "artist": artist}
+    return updates
+
+def backfill_scryfall_artists() -> int:
+    targets = collect_missing_artist_targets()
+    if not targets:
+        return 0
+    total_updated = 0
+    if len(targets) > SCRYFALL_BULK_BACKFILL_THRESHOLD:
+        bulk_updates = backfill_scryfall_artists_from_bulk(targets)
+        if bulk_updates:
+            _commit_scryfall_cache_updates(bulk_updates)
+            total_updated += len(bulk_updates)
+            targets = collect_missing_artist_targets()
+        else:
+            return total_updated
+
+    if targets and len(targets) <= SCRYFALL_BULK_BACKFILL_THRESHOLD:
+        updates, _ = backfill_scryfall_artists_batch(targets)
+        if updates:
+            _commit_scryfall_cache_updates(updates)
+            total_updated += len(updates)
+
+    if total_updated > 0:
+        clear_all_caches()
+    return total_updated
+
+async def background_scryfall_artist_backfill():
+    try:
+        await asyncio.sleep(15)
+        targets = await run_in_threadpool(collect_missing_artist_targets)
+        if not targets:
+            return
+        print(f"[SCRYFALL BACKFILL] Avvio recupero artisti in background per {len(targets)} carte in cache...")
+        total_updated = 0
+        if len(targets) > SCRYFALL_BULK_BACKFILL_THRESHOLD:
+            bulk_updates = await run_in_threadpool(backfill_scryfall_artists_from_bulk, targets)
+            if bulk_updates:
+                await run_in_threadpool(_commit_scryfall_cache_updates, bulk_updates)
+                total_updated += len(bulk_updates)
+                targets = await run_in_threadpool(collect_missing_artist_targets)
+            else:
+                targets = []
+
+        if targets and len(targets) <= SCRYFALL_BULK_BACKFILL_THRESHOLD:
+            updates, _ = await run_in_threadpool(backfill_scryfall_artists_batch, targets)
+            if updates:
+                await run_in_threadpool(_commit_scryfall_cache_updates, updates)
+                total_updated += len(updates)
+
+        if total_updated > 0:
+            await run_in_threadpool(clear_all_caches)
+        print(f"[SCRYFALL BACKFILL] Completato: aggiornati {total_updated} record nella cache.")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logging.warning(f"[SCRYFALL BACKFILL] Errore durante il recupero artisti: {e}")
 
 def fetch_scryfall_data(card_names):
     results = load_scryfall_cache()
@@ -686,17 +990,9 @@ def fetch_scryfall_data(card_names):
                     json={"identifiers": identifiers}, 
                     timeout=15
                 )
-                if res.status_code == 429:
-                    std_time.sleep(1.5)
-                    _wait_scryfall_rate_limit()
-                    res = session.post(
-                        "https://api.scryfall.com/cards/collection",
-                        json={"identifiers": identifiers},
-                        timeout=15
-                    )
 
                 if res.status_code in (429, 403):
-                    logging.warning(f"[SCRYFALL] Ricevuto HTTP {res.status_code} su /cards/collection; interrompo solo questo batch.")
+                    logging.warning(f"[SCRYFALL] Ricevuto HTTP {res.status_code} su /cards/collection; interrompo questo batch nel rispetto del rate limit.")
                     break
                 if res.status_code == 200:
                     body = res.json()
@@ -717,7 +1013,7 @@ def fetch_scryfall_data(card_names):
                         )
                         
                         if is_reversible_override or is_showcase_or_weird:
-                            std_time.sleep(0.12) 
+                            _wait_scryfall_rate_limit()
                             query_name = faces_names[0] if is_reversible_override and faces_names else name
                             if is_reversible_override:
                                 q_str = f'!"{query_name}" -is:dfc -is:split -is:adventure -is:extra -is:promo -frame:showcase -layout:art_series -layout:token -type:card'
@@ -782,7 +1078,7 @@ def fetch_scryfall_data(card_names):
                         resolved_via_named = False
                         if " // " in nf_name:
                             try:
-                                std_time.sleep(0.12)
+                                _wait_scryfall_rate_limit()
                                 named_res = session.get(
                                     "https://api.scryfall.com/cards/named",
                                     params={"exact": nf_name},
@@ -898,7 +1194,7 @@ def extract_commander_metadata(name: str, scryfall_cache: dict):
 def extract_commander_search_fields(name: str, scryfall_cache: dict) -> dict:
     """Restituisce metadati aggiuntivi per ricerca Scryfall sui comandanti (type, cmc, keywords)."""
     if not name or not name.strip():
-        return {"type": "", "cmc": 0.0, "keywords": [], "mana_cost": ""}
+        return {"type": "", "cmc": 0.0, "keywords": [], "mana_cost": "", "artist": ""}
     if " / " in name and " // " not in name:
         parts = [p.strip() for p in name.split(" / ") if p.strip()]
     else:
@@ -908,6 +1204,7 @@ def extract_commander_search_fields(name: str, scryfall_cache: dict) -> dict:
     cmcs = []
     keywords = []
     mana_costs = []
+    artists = []
     for part in parts:
         info = lookup_card_info(scryfall_cache, part)
         if not info and " // " in part:
@@ -922,6 +1219,8 @@ def extract_commander_search_fields(name: str, scryfall_cache: dict) -> dict:
                 cmcs.append(float(info["cmc"]))
             if info.get("mana_cost"):
                 mana_costs.append(info["mana_cost"])
+            if info.get("artist"):
+                artists.append(info["artist"])
             for kw in info.get("keywords", []) or []:
                 if kw not in keywords:
                     keywords.append(kw)
@@ -931,6 +1230,7 @@ def extract_commander_search_fields(name: str, scryfall_cache: dict) -> dict:
         "cmc": max(cmcs) if cmcs else 0.0,
         "keywords": keywords,
         "mana_cost": " // ".join(mana_costs),
+        "artist": artists[0] if artists else "",
     }
 
 def categorizza_tipo(type_line):
@@ -1082,6 +1382,7 @@ def get_valid_commanders_set(filtro_tempo: str):
                 "cmc": search_meta["cmc"],
                 "keywords": search_meta["keywords"],
                 "mana_cost": search_meta["mana_cost"],
+                "artist": search_meta["artist"],
             })
             
     return frozenset(valid_set), result_list
@@ -1524,6 +1825,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
             mana_cost_val = cmd_meta["mana_cost"]
             keywords_val = cmd_meta["keywords"]
             colors_val = final_color_identity
+            artist_val = cmd_meta["artist"]
         else:
             main_info = lookup_card_info(scryfall_cache, name)
             images = list(dict.fromkeys(main_info.get("images", [])))
@@ -1535,6 +1837,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
             mana_cost_val = main_info.get("mana_cost", "")
             keywords_val = main_info.get("keywords", [])
             colors_val = main_info.get("colors")
+            artist_val = main_info.get("artist", "")
 
         t_val = row.get('trend')
         if t_val is None:
@@ -1553,7 +1856,8 @@ def get_dashboard_data_cached(filtro_tempo: str):
             "cmc": cmc_val,
             "oracles": oracles,
             "color_identity": final_color_identity,
-            "set_code": row.get("set_code")
+            "set_code": row.get("set_code"),
+            "artist": artist_val,
         }
         if mana_cost_val:
             item_out["mana_cost"] = mana_cost_val
@@ -1720,6 +2024,7 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
             "Sinergia": float(row['Sinergia']),
             "images": info.get("images", []),
             "art_crops": info.get("art_crops", []),
+            "artist": info.get("artist", ""),
             "oracles": info.get("oracles", []),
             "color_identity": info.get("color_identity", []),
             "category": cat,
@@ -1773,6 +2078,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
             "card_name": card_name,
             "images": card_info_cache.get("images", []),
             "art_crops": card_info_cache.get("art_crops", []),
+            "artist": card_info_cache.get("artist", ""),
             "oracles": card_info_cache.get("oracles", []),
             "total_decks_with_card": 0,
             "total_decks_global": 0,
@@ -1808,6 +2114,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
             "card_name": card_name,
             "images": card_info_cache.get("images", []),
             "art_crops": card_info_cache.get("art_crops", []),
+            "artist": card_info_cache.get("artist", ""),
             "oracles": card_info_cache.get("oracles", []),
             "total_decks_with_card": 0,
             "total_decks_global": total_decks_global,
@@ -1854,7 +2161,8 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
             "totale_comandante": int(row['totale_comandante']),
             "Percentuale": float(row['Percentuale']),
             "images": images,
-            "art_crops": art_crops
+            "art_crops": art_crops,
+            "artist": extract_commander_search_fields(name, scryfall_cache)["artist"]
         })
         
     syn_query = f"""
@@ -1899,6 +2207,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
             "Percentuale": float(row['Percentuale']),
             "images": inf.get("images", []),
             "art_crops": inf.get("art_crops", []),
+            "artist": inf.get("artist", ""),
             "oracles": inf.get("oracles", []),
             "color_identity": inf.get("color_identity", []),
             "category": categorizza_tipo(inf.get("type", ""))
@@ -1908,6 +2217,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
         "card_name": card_name,
         "images": card_info_cache.get("images", []),
         "art_crops": card_info_cache.get("art_crops", []),
+        "artist": card_info_cache.get("artist", ""),
         "oracles": card_info_cache.get("oracles", []),
         "total_decks_with_card": total_decks_time,
         "total_decks_global": total_decks_global,
@@ -1990,6 +2300,7 @@ def _get_card_details_safe(card_name: str, filtro_tempo: str):
             "card_name": "",
             "images": [],
             "art_crops": [],
+            "artist": "",
             "oracles": [],
             "total_decks_with_card": 0,
             "total_decks_global": 0,
@@ -2005,6 +2316,7 @@ def _get_card_details_safe(card_name: str, filtro_tempo: str):
             "card_name": card_name,
             "images": card_info_cache.get("images", []),
             "art_crops": card_info_cache.get("art_crops", []),
+            "artist": card_info_cache.get("artist", ""),
             "oracles": card_info_cache.get("oracles", []),
             "total_decks_with_card": 0,
             "total_decks_global": 0,
@@ -2395,6 +2707,20 @@ def cleanup_lands_from_community_db():
     finally:
         conn.close()
 
+def cleanup_expired_community_votes(retention_days: int = COMMUNITY_VOTES_RETENTION_DAYS) -> int:
+    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
+    conn = get_community_db()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM community_votes WHERE created_at < ?", (cutoff,))
+        deleted = c.rowcount
+        conn.commit()
+        if deleted > 0:
+            print(f"[COMMUNITY DB] Eliminati {deleted} record di voto più vecchi di {retention_days} giorni (statistiche aggregate preservate).")
+        return deleted
+    finally:
+        conn.close()
+
 def _clean_ip(ip_str: Optional[str]) -> Optional[str]:
     if not ip_str:
         return None
@@ -2732,6 +3058,7 @@ def get_random_community_card(voter_hash: str):
         "card_name": chosen_card,
         "images": info.get("images", []),
         "art_crops": info.get("art_crops", []),
+        "artist": info.get("artist", ""),
         "oracles": info.get("oracles", []),
         "type": info.get("type", "Carta"),
         "cmc": info.get("cmc", 0.0),
@@ -2942,6 +3269,7 @@ def get_community_leaderboard(
             "last_voted_at": r['last_voted_at'],
             "images": info.get("images", []),
             "art_crops": info.get("art_crops", []),
+            "artist": info.get("artist", ""),
             "type": info.get("type", "Carta"),
             "cmc": info.get("cmc", 0.0),
             "color_identity": info.get("color_identity", [])
@@ -2958,7 +3286,7 @@ def get_community_overview():
     comm_conn = get_community_db()
     c = comm_conn.cursor()
     try:
-        total_votes = c.execute("SELECT COUNT(*) as cnt FROM community_votes").fetchone()['cnt']
+        total_votes = c.execute("SELECT COALESCE(SUM(total_votes), 0) as cnt FROM community_ratings").fetchone()['cnt']
         total_cards_rated = c.execute("SELECT COUNT(*) as cnt FROM community_ratings WHERE total_votes > 0").fetchone()['cnt']
 
         # Top 3 per media
@@ -2995,7 +3323,8 @@ def get_community_overview():
             "total_votes": row['total_votes'],
             "avg_score": row['avg_score'],
             "images": info.get("images", []),
-            "art_crops": info.get("art_crops", [])
+            "art_crops": info.get("art_crops", []),
+            "artist": info.get("artist", "")
         }
 
     return {

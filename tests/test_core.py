@@ -121,6 +121,214 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
                     on_disk = json.load(f)
                 self.assertEqual(list(on_disk.keys()), ["Counterspell"])
 
+    def test_parse_scryfall_artist_and_backfill(self):
+        single = main._parse_scryfall_card_object({
+            "name": "Lightning Bolt",
+            "type_line": "Instant",
+            "image_uris": {"normal": "https://cards.scryfall.io/normal/front/a/a/11111111-1111-1111-1111-111111111111.jpg", "art_crop": "https://cards.scryfall.io/art_crop/front/a/a/11111111-1111-1111-1111-111111111111.jpg"},
+            "oracle_text": "Lightning Bolt deals 3 damage to any target.",
+            "artist": "Christopher Moeller",
+        })
+        self.assertEqual(single["artist"], "Christopher Moeller")
+
+        dfc = main._parse_scryfall_card_object({
+            "name": "Delver of Secrets // Insectile Aberration",
+            "card_faces": [
+                {
+                    "name": "Delver of Secrets",
+                    "type_line": "Creature — Human Wizard",
+                    "image_uris": {"normal": "https://img/f1.jpg", "art_crop": "https://img/a1.jpg"},
+                    "oracle_text": "At the beginning of your upkeep...",
+                    "artist": "Nils Hamm",
+                },
+                {
+                    "name": "Insectile Aberration",
+                    "type_line": "Creature — Human Insect",
+                    "image_uris": {"normal": "https://img/f2.jpg", "art_crop": "https://img/a2.jpg"},
+                    "oracle_text": "Flying",
+                    "artist": "Nils Hamm",
+                },
+            ],
+        })
+        self.assertEqual(dfc["artist"], "Nils Hamm")
+
+        bolt_uuid = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cache_file = os.path.join(tmpdir, "scryfall_cache.json")
+            comm_db = os.path.join(tmpdir, "community.db")
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "lightning bolt": {
+                        "full_name": "Lightning Bolt",
+                        "images": [f"https://cards.scryfall.io/normal/front/1/1/{bolt_uuid}.jpg?123"],
+                        "art_crops": [f"https://cards.scryfall.io/art_crop/front/1/1/{bolt_uuid}.jpg?123"],
+                        "type": "Instant",
+                    },
+                    "counterspell": {
+                        "full_name": "Counterspell",
+                        "images": ["https://cards.scryfall.io/normal/front/2/2/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jpg"],
+                        "art_crops": ["https://cards.scryfall.io/art_crop/front/2/2/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jpg"],
+                        "type": "Instant",
+                        "artist": "Zack Stella",
+                    },
+                }, f)
+
+            posted_payloads = []
+
+            class _FakeSession:
+                def post(self, url, json=None, timeout=15):
+                    posted_payloads.append(json)
+                    return SimpleNamespace(
+                        status_code=200,
+                        json=lambda: {
+                            "data": [{
+                                "id": bolt_uuid,
+                                "name": "Lightning Bolt",
+                                "artist": "Christopher Rush",
+                            }]
+                        },
+                    )
+
+            def _get_test_comm_db():
+                conn = sqlite3.connect(comm_db, timeout=30)
+                conn.row_factory = sqlite3.Row
+                return conn
+
+            with (
+                patch.object(main, "CACHE_FILE", cache_file),
+                patch.object(main, "COMMUNITY_DB_PATH", comm_db),
+                patch.object(main, "_SCRYFALL_CACHE_MEMORY", None),
+                patch.object(main, "get_scryfall_session", return_value=_FakeSession()),
+                patch.object(main, "_wait_scryfall_rate_limit", return_value=None),
+                patch.object(main, "get_community_db", side_effect=_get_test_comm_db),
+            ):
+                updated_count = main.backfill_scryfall_artists()
+                self.assertEqual(updated_count, 1)
+                self.assertEqual(posted_payloads, [{"identifiers": [{"id": bolt_uuid}]}])
+
+                reloaded = main.load_scryfall_cache()
+                self.assertEqual(reloaded["lightning bolt"]["artist"], "Christopher Rush")
+                self.assertEqual(
+                    reloaded["lightning bolt"]["art_crops"],
+                    [f"https://cards.scryfall.io/art_crop/front/1/1/{bolt_uuid}.jpg?123"],
+                )
+                self.assertEqual(reloaded["counterspell"]["artist"], "Zack Stella")
+
+                main.setup_community_db()
+                c = _get_test_comm_db()
+                try:
+                    c.execute(
+                        "INSERT INTO community_ratings (card_name, total_votes, score_sum, avg_score) VALUES ('Lightning Bolt', 5, 25, 5.0)"
+                    )
+                    c.commit()
+                finally:
+                    c.close()
+
+                overview = main.get_community_overview()
+                self.assertEqual(overview["top_rated"][0]["artist"], "Christopher Rush")
+                lb = main.get_community_leaderboard(min_votes=2)
+                self.assertEqual(lb["items"][0]["artist"], "Christopher Rush")
+
+    def test_backfill_scryfall_artists_from_bulk_jsonl_gz(self):
+        import gzip
+        import io
+
+        uuid_target = "11111111-2222-3333-4444-555555555555"
+        uuid_other = "99999999-8888-7777-6666-555555555555"
+
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            rows = [
+                {
+                    "id": uuid_other,
+                    "name": "Opt",
+                    "artist": "Wrong Printing Artist",
+                },
+                {
+                    "id": uuid_target,
+                    "name": "Opt",
+                    "artist": "John Avon",
+                },
+                {
+                    "id": "aaaaaaaa-0000-0000-0000-000000000001",
+                    "name": "Dark Ritual",
+                    "artist": "Sandra Everingham",
+                },
+            ]
+            payload = "\n".join(json.dumps(r) for r in rows) + "\n"
+            gz.write(payload.encode("utf-8"))
+        gz_bytes = buf.getvalue()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cache_file = os.path.join(tmpdir, "scryfall_cache.json")
+            comm_db = os.path.join(tmpdir, "community.db")
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "opt": {
+                        "full_name": "Opt",
+                        "images": [f"https://cards.scryfall.io/normal/front/1/1/{uuid_target}.jpg?123"],
+                        "art_crops": [f"https://cards.scryfall.io/art_crop/front/1/1/{uuid_target}.jpg?123"],
+                        "type": "Instant",
+                    },
+                    "dark ritual": {
+                        "full_name": "Dark Ritual",
+                        "images": ["https://example.invalid/no-uuid.jpg"],
+                        "art_crops": ["https://example.invalid/no-uuid-art.jpg"],
+                        "type": "Instant",
+                    },
+                }, f)
+
+            requested_urls = []
+
+            class _FakeBulkResponse:
+                status_code = 200
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def iter_content(self, chunk_size=65536):
+                    yield gz_bytes[:30]
+                    yield gz_bytes[30:]
+
+            class _FakeBulkSession:
+                def get(self, url, stream=False, timeout=15):
+                    requested_urls.append(url)
+                    if "bulk-data/default-cards" in url:
+                        return SimpleNamespace(
+                            status_code=200,
+                            json=lambda: {
+                                "jsonl_download_uri": "https://data.scryfall.io/default-cards/test.jsonl.gz"
+                            },
+                        )
+                    return _FakeBulkResponse()
+
+            with (
+                patch.object(main, "CACHE_FILE", cache_file),
+                patch.object(main, "COMMUNITY_DB_PATH", comm_db),
+                patch.object(main, "_SCRYFALL_CACHE_MEMORY", None),
+                patch.object(main, "get_scryfall_session", return_value=_FakeBulkSession()),
+                patch.object(main, "_wait_scryfall_rate_limit", return_value=None),
+            ):
+                targets = main.collect_missing_artist_targets()
+                updates = main.backfill_scryfall_artists_from_bulk(targets)
+                self.assertEqual(len(updates), 2)
+                self.assertEqual(updates["opt"]["artist"], "John Avon")
+                self.assertEqual(
+                    updates["opt"]["art_crops"],
+                    [f"https://cards.scryfall.io/art_crop/front/1/1/{uuid_target}.jpg?123"],
+                )
+                self.assertEqual(updates["dark ritual"]["artist"], "Sandra Everingham")
+                self.assertEqual(
+                    requested_urls,
+                    [
+                        "https://api.scryfall.com/bulk-data/default-cards",
+                        "https://data.scryfall.io/default-cards/test.jsonl.gz",
+                    ],
+                )
+
 
 class TestCommunityVotesConcurrency(unittest.TestCase):
     def test_concurrent_votes_accumulate_accurately(self):
@@ -174,6 +382,82 @@ class TestCommunityVotesConcurrency(unittest.TestCase):
                 self.assertEqual(row["avg_score"], 4.0)
                 self.assertEqual(row["stars_5"], 4)
                 self.assertEqual(row["stars_3"], 4)
+
+    def test_cleanup_expired_community_votes_preserves_ratings_and_overview(self):
+        from datetime import timedelta
+
+        now = main.datetime.now()
+        old_ts = (now - timedelta(days=400)).isoformat()
+        recent_ts = (now - timedelta(days=10)).isoformat()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            comm_db = os.path.join(tmpdir, "community.db")
+
+            def _get_test_comm_db():
+                conn = sqlite3.connect(comm_db, timeout=30)
+                conn.row_factory = sqlite3.Row
+                return conn
+
+            fake_scryfall = {
+                "lightning bolt": {
+                    "cmc": 1,
+                    "type": "Instant",
+                    "color_identity": ["R"],
+                    "images": ["https://img/lb.jpg"],
+                    "art_crops": ["https://img/lb_art.jpg"],
+                }
+            }
+
+            with (
+                patch.object(main, "get_community_db", side_effect=_get_test_comm_db),
+                patch.object(main, "load_scryfall_cache", return_value=fake_scryfall),
+                patch.object(main, "fetch_scryfall_data", return_value=fake_scryfall),
+            ):
+                main.setup_community_db()
+                conn = _get_test_comm_db()
+                try:
+                    conn.execute(
+                        "INSERT INTO community_votes (card_name, voter_hash, score, created_at) VALUES (?, ?, ?, ?)",
+                        ("Lightning Bolt", "old_hash", 5, old_ts),
+                    )
+                    conn.execute(
+                        "INSERT INTO community_votes (card_name, voter_hash, score, created_at) VALUES (?, ?, ?, ?)",
+                        ("Lightning Bolt", "recent_hash", 3, recent_ts),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO community_ratings
+                        (card_name, total_votes, score_sum, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5, last_voted_at)
+                        VALUES ('Lightning Bolt', 2, 8, 4.0, 0, 0, 1, 0, 1, ?)
+                        """,
+                        (recent_ts,),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                deleted = main.cleanup_expired_community_votes()
+                self.assertEqual(deleted, 1)
+
+                conn = _get_test_comm_db()
+                try:
+                    remaining_votes = conn.execute(
+                        "SELECT voter_hash, score FROM community_votes"
+                    ).fetchall()
+                    rating_row = conn.execute(
+                        "SELECT total_votes, score_sum, avg_score FROM community_ratings WHERE card_name = ?",
+                        ("Lightning Bolt",),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+                self.assertEqual([r["voter_hash"] for r in remaining_votes], ["recent_hash"])
+                self.assertEqual(rating_row["total_votes"], 2)
+                self.assertEqual(rating_row["score_sum"], 8)
+                self.assertEqual(rating_row["avg_score"], 4.0)
+
+                overview = main.get_community_overview()
+                self.assertEqual(overview["total_votes"], 2)
 
 
 class TestMdfcAndDailyCacheFreshness(unittest.TestCase):
@@ -294,6 +578,11 @@ class TestMetagameHistory(unittest.TestCase):
 
 class TestScryfallRateLimitPacing(unittest.TestCase):
     def test_wait_scryfall_rate_limit_spaces_calls(self):
+        import inspect
+
+        default_interval = inspect.signature(main._wait_scryfall_rate_limit).parameters["min_interval"].default
+        self.assertGreaterEqual(default_interval, 0.5)
+
         with patch.object(main, "_scryfall_last_request_ts", 0.0):
             t0 = main.std_time.monotonic()
             main._wait_scryfall_rate_limit(0.05)

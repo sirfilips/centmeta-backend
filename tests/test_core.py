@@ -155,7 +155,6 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
         bolt_uuid = "11111111-2222-3333-4444-555555555555"
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             cache_file = os.path.join(tmpdir, "scryfall_cache.json")
-            comm_db = os.path.join(tmpdir, "community.db")
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump({
                     "lightning bolt": {
@@ -189,18 +188,11 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
                         },
                     )
 
-            def _get_test_comm_db():
-                conn = sqlite3.connect(comm_db, timeout=30)
-                conn.row_factory = sqlite3.Row
-                return conn
-
             with (
                 patch.object(main, "CACHE_FILE", cache_file),
-                patch.object(main, "COMMUNITY_DB_PATH", comm_db),
                 patch.object(main, "_SCRYFALL_CACHE_MEMORY", None),
                 patch.object(main, "get_scryfall_session", return_value=_FakeSession()),
                 patch.object(main, "_wait_scryfall_rate_limit", return_value=None),
-                patch.object(main, "get_community_db", side_effect=_get_test_comm_db),
             ):
                 updated_count = main.backfill_scryfall_artists()
                 self.assertEqual(updated_count, 1)
@@ -213,21 +205,6 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
                     [f"https://cards.scryfall.io/art_crop/front/1/1/{bolt_uuid}.jpg?123"],
                 )
                 self.assertEqual(reloaded["counterspell"]["artist"], "Zack Stella")
-
-                main.setup_community_db()
-                c = _get_test_comm_db()
-                try:
-                    c.execute(
-                        "INSERT INTO community_ratings (card_name, total_votes, score_sum, avg_score) VALUES ('Lightning Bolt', 5, 25, 5.0)"
-                    )
-                    c.commit()
-                finally:
-                    c.close()
-
-                overview = main.get_community_overview()
-                self.assertEqual(overview["top_rated"][0]["artist"], "Christopher Rush")
-                lb = main.get_community_leaderboard(min_votes=2)
-                self.assertEqual(lb["items"][0]["artist"], "Christopher Rush")
 
     def test_backfill_scryfall_artists_from_bulk_jsonl_gz(self):
         import gzip
@@ -261,7 +238,6 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             cache_file = os.path.join(tmpdir, "scryfall_cache.json")
-            comm_db = os.path.join(tmpdir, "community.db")
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump({
                     "opt": {
@@ -307,7 +283,6 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
 
             with (
                 patch.object(main, "CACHE_FILE", cache_file),
-                patch.object(main, "COMMUNITY_DB_PATH", comm_db),
                 patch.object(main, "_SCRYFALL_CACHE_MEMORY", None),
                 patch.object(main, "get_scryfall_session", return_value=_FakeBulkSession()),
                 patch.object(main, "_wait_scryfall_rate_limit", return_value=None),
@@ -328,136 +303,6 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
                         "https://data.scryfall.io/default-cards/test.jsonl.gz",
                     ],
                 )
-
-
-class TestCommunityVotesConcurrency(unittest.TestCase):
-    def test_concurrent_votes_accumulate_accurately(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-            comm_db = os.path.join(tmpdir, "community.db")
-
-            def _get_test_comm_db():
-                conn = sqlite3.connect(comm_db, timeout=30, check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA busy_timeout = 30000;")
-                return conn
-
-            with (
-                patch.object(main, "get_community_db", side_effect=_get_test_comm_db),
-                patch.object(main, "get_community_card_pools", return_value=(["Lightning Bolt"], [], [])),
-                patch.object(main, "_COMMUNITY_VALID_CARDS_SET", {"Lightning Bolt"}),
-                patch.object(main, "is_land_card", return_value=False),
-            ):
-                main.setup_community_db()
-
-                errors = []
-                barrier = threading.Barrier(8)
-
-                def _worker(idx: int):
-                    try:
-                        barrier.wait(timeout=5)
-                        main.record_community_vote("Lightning Bolt", 5 if idx % 2 == 0 else 3, f"voter_{idx}")
-                    except Exception as exc:
-                        errors.append(exc)
-
-                threads = [threading.Thread(target=_worker, args=(i,)) for i in range(8)]
-                for t in threads:
-                    t.start()
-                for t in threads:
-                    t.join(timeout=10)
-
-                self.assertEqual(errors, [])
-                conn = _get_test_comm_db()
-                try:
-                    row = conn.execute(
-                        "SELECT total_votes, score_sum, avg_score, stars_5, stars_3 FROM community_ratings WHERE card_name = ?",
-                        ("Lightning Bolt",),
-                    ).fetchone()
-                finally:
-                    conn.close()
-
-                self.assertIsNotNone(row)
-                self.assertEqual(row["total_votes"], 8)
-                self.assertEqual(row["score_sum"], 32)
-                self.assertEqual(row["avg_score"], 4.0)
-                self.assertEqual(row["stars_5"], 4)
-                self.assertEqual(row["stars_3"], 4)
-
-    def test_cleanup_expired_community_votes_preserves_ratings_and_overview(self):
-        from datetime import timedelta
-
-        now = main.datetime.now()
-        old_ts = (now - timedelta(days=400)).isoformat()
-        recent_ts = (now - timedelta(days=10)).isoformat()
-
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-            comm_db = os.path.join(tmpdir, "community.db")
-
-            def _get_test_comm_db():
-                conn = sqlite3.connect(comm_db, timeout=30)
-                conn.row_factory = sqlite3.Row
-                return conn
-
-            fake_scryfall = {
-                "lightning bolt": {
-                    "cmc": 1,
-                    "type": "Instant",
-                    "color_identity": ["R"],
-                    "images": ["https://img/lb.jpg"],
-                    "art_crops": ["https://img/lb_art.jpg"],
-                }
-            }
-
-            with (
-                patch.object(main, "get_community_db", side_effect=_get_test_comm_db),
-                patch.object(main, "load_scryfall_cache", return_value=fake_scryfall),
-                patch.object(main, "fetch_scryfall_data", return_value=fake_scryfall),
-            ):
-                main.setup_community_db()
-                conn = _get_test_comm_db()
-                try:
-                    conn.execute(
-                        "INSERT INTO community_votes (card_name, voter_hash, score, created_at) VALUES (?, ?, ?, ?)",
-                        ("Lightning Bolt", "old_hash", 5, old_ts),
-                    )
-                    conn.execute(
-                        "INSERT INTO community_votes (card_name, voter_hash, score, created_at) VALUES (?, ?, ?, ?)",
-                        ("Lightning Bolt", "recent_hash", 3, recent_ts),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO community_ratings
-                        (card_name, total_votes, score_sum, avg_score, stars_1, stars_2, stars_3, stars_4, stars_5, last_voted_at)
-                        VALUES ('Lightning Bolt', 2, 8, 4.0, 0, 0, 1, 0, 1, ?)
-                        """,
-                        (recent_ts,),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-
-                deleted = main.cleanup_expired_community_votes()
-                self.assertEqual(deleted, 1)
-
-                conn = _get_test_comm_db()
-                try:
-                    remaining_votes = conn.execute(
-                        "SELECT voter_hash, score FROM community_votes"
-                    ).fetchall()
-                    rating_row = conn.execute(
-                        "SELECT total_votes, score_sum, avg_score FROM community_ratings WHERE card_name = ?",
-                        ("Lightning Bolt",),
-                    ).fetchone()
-                finally:
-                    conn.close()
-
-                self.assertEqual([r["voter_hash"] for r in remaining_votes], ["recent_hash"])
-                self.assertEqual(rating_row["total_votes"], 2)
-                self.assertEqual(rating_row["score_sum"], 8)
-                self.assertEqual(rating_row["avg_score"], 4.0)
-
-                overview = main.get_community_overview()
-                self.assertEqual(overview["total_votes"], 2)
 
 
 class TestMdfcAndDailyCacheFreshness(unittest.TestCase):
@@ -713,7 +558,7 @@ class TestRoleClassificationAndScryfallSearch(unittest.TestCase):
             pred = scryfall_search.compile_scryfall_query(bad_q)
             self.assertIsInstance(pred(cards[0]), bool)
 
-    def test_dashboard_role_categories_respect_period_and_leaderboard_scryfall(self):
+    def test_dashboard_role_categories_respect_period(self):
         from datetime import timedelta
 
         now = main.datetime.now()
@@ -732,15 +577,8 @@ class TestRoleClassificationAndScryfallSearch(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            comm_db = os.path.join(tmpdir, "community.db")
-
             def _get_test_db():
                 c = sqlite3.connect(main_db, timeout=30)
-                c.row_factory = sqlite3.Row
-                return c
-
-            def _get_test_comm_db():
-                c = sqlite3.connect(comm_db, timeout=30)
                 c.row_factory = sqlite3.Row
                 return c
 
@@ -766,22 +604,6 @@ class TestRoleClassificationAndScryfallSearch(unittest.TestCase):
             self.assertEqual([c["name"] for c in by_role["burn"]["cards"]], ["Lightning Bolt"])
             # Brainstorm è solo nei 90 giorni fa, non negli ultimi 30 giorni
             self.assertEqual(by_role["card_draw"]["cards"], [])
-
-            with (
-                patch.object(main, "get_community_db", side_effect=_get_test_comm_db),
-                patch.object(main, "load_scryfall_cache", return_value=fake_scryfall),
-                patch.object(main, "fetch_scryfall_data", return_value=fake_scryfall),
-            ):
-                main.setup_community_db()
-                c = _get_test_comm_db()
-                c.execute("INSERT INTO community_ratings (card_name, total_votes, score_sum, avg_score) VALUES ('Lightning Bolt', 5, 25, 5.0)")
-                c.execute("INSERT INTO community_ratings (card_name, total_votes, score_sum, avg_score) VALUES ('Brainstorm', 5, 24, 4.8)")
-                c.commit()
-                c.close()
-
-                lb = main.get_community_leaderboard(min_votes=2, search="o:damage id:r")
-                self.assertEqual(lb["total"], 1)
-                self.assertEqual(lb["items"][0]["card_name"], "Lightning Bolt")
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ trap on_signal SIGINT SIGTERM
 # --- Avvio ------------------------------------------------------------------------
 cd "$BASE_DIR"
 log "Avvio backend su $BIND_HOST:$BACKEND_PORT"
-"$VENV_DIR/bin/uvicorn" main:app --app-dir "$BASE_DIR" --host "$BIND_HOST" --port "$BACKEND_PORT" &
+"$VENV_DIR/bin/uvicorn" main:app --app-dir "$BASE_DIR" --host "$BIND_HOST" --port "$BACKEND_PORT" --no-access-log &
 PID_BACKEND=$!
 
 cd "$FRONTEND_DIR"

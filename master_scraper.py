@@ -20,6 +20,7 @@ except ImportError:
 SOGLIA_MINIMA_RISULTATI = 0.9
 MIN_MAZZI_PER_CONTROLLO = 20
 MAX_PAGINE_RICERCA = 500
+MOXFIELD_SEARCH_CAP = 10000
 
 # Inizializza i percorsi base
 cartella_script = os.path.dirname(os.path.abspath(__file__))
@@ -425,6 +426,8 @@ def _run_scraper_locked(stop_event: Optional[threading.Event] = None) -> bool:
     search_decks = []
     seen_public_ids = set()
     search_failed = False
+    reported_total_results: Optional[int] = None
+    reported_total_pages: Optional[int] = None
 
     while page <= MAX_PAGINE_RICERCA:
         if stop_event is not None and stop_event.is_set():
@@ -445,6 +448,10 @@ def _run_scraper_locked(stop_event: Optional[threading.Event] = None) -> bool:
                     body = response.json()
                     if not isinstance(body, dict):
                         raise ValueError("Risposta JSON non valida dalla ricerca Moxfield")
+                    if isinstance(body.get("totalResults"), int):
+                        reported_total_results = body["totalResults"]
+                    if isinstance(body.get("totalPages"), int):
+                        reported_total_pages = body["totalPages"]
                     data = body.get("data", [])
                     success = True
                     break
@@ -491,17 +498,34 @@ def _run_scraper_locked(stop_event: Optional[threading.Event] = None) -> bool:
             break
             
         logging.info(f"Raccolti link pagina {page} (Totale mazzi in coda: {len(search_decks)})...")
+        if reported_total_pages is not None and page >= reported_total_pages:
+            break
         page += 1
-        if _interruptible_sleep(3.0, stop_event):
-            logging.info("[SHUTDOWN] Scraper interrotto in modo pulito tra le pagine di ricerca.")
-            return False
-
-    if page > MAX_PAGINE_RICERCA:
-        logging.warning(f"Raggiunto limite massimo pagine ({MAX_PAGINE_RICERCA}). Procedo con i mazzi raccolti.")
 
     if search_failed:
         logging.error("Fase di ricerca fallita. Interruzione senza modificare il database.")
         return False
+
+    hit_page_limit = page > MAX_PAGINE_RICERCA
+    hit_moxfield_cap = (
+        (reported_total_results is not None and reported_total_results >= MOXFIELD_SEARCH_CAP)
+        or len(search_decks) >= MOXFIELD_SEARCH_CAP
+    )
+    early_empty_stop = (
+        reported_total_pages is not None
+        and page < reported_total_pages
+    )
+    search_truncated = hit_page_limit or hit_moxfield_cap or early_empty_stop
+
+    if search_truncated:
+        logging.warning(
+            "[SAFETY] Ricerca Moxfield troncata (page=%s, totalResults=%s, totalPages=%s, raccolti=%s): "
+            "rimozione dei mazzi non trovati disabilitata per questo giro (verranno rimossi solo i mazzi in blacklist).",
+            page,
+            reported_total_results,
+            reported_total_pages,
+            len(search_decks),
+        )
 
     # 4. CONTROLLO DI SICUREZZA SOGLIA (Safety Check)
     force_run = os.environ.get("SCRAPER_FORCE") == "1"
@@ -548,8 +572,11 @@ def _run_scraper_locked(stop_event: Optional[threading.Event] = None) -> bool:
             stat_new += 1
             to_download.append(deck)
 
-    # Rimossi = tutti i mazzi nel DB che NON sono in active_search_ids (quindi mancanti dalla search O in blacklist)
-    db_removed_ids = [d_id for d_id in db_decks.keys() if d_id not in active_search_ids]
+    # Rimossi = mazzi non presenti in active_search_ids (se ricerca completa) o solo in blacklist (se ricerca troncata)
+    if search_truncated:
+        db_removed_ids = [d_id for d_id in db_decks.keys() if d_id in blacklisted_ids]
+    else:
+        db_removed_ids = [d_id for d_id in db_decks.keys() if d_id not in active_search_ids]
 
     # 6. MODALITÀ DRY RUN
     if is_dry_run:
@@ -636,8 +663,30 @@ def _run_scraper_locked(stop_event: Optional[threading.Event] = None) -> bool:
         cursor.execute("SELECT id_moxfield FROM decks")
         current_db_decks = {row[0] for row in cursor.fetchall()}
         
-        # (c) Rimozione dei mazzi obsoleti (Mancanti da final_active_ids)
-        final_removed_ids = [d_id for d_id in current_db_decks if d_id not in final_active_ids]
+        # (c) Rimozione dei mazzi obsoleti (protetta contro troncamento ricerca e drift paginazione)
+        blacklisted_to_remove = [d_id for d_id in current_db_decks if d_id in runtime_blacklisted]
+        missing_non_blacklisted = [
+            d_id for d_id in current_db_decks
+            if d_id not in final_active_ids and d_id not in runtime_blacklisted
+        ]
+        if search_truncated:
+            final_removed_ids = blacklisted_to_remove
+        elif (
+            not force_run
+            and len(current_db_decks) >= MIN_MAZZI_PER_CONTROLLO
+            and len(missing_non_blacklisted) > max(1, int(len(current_db_decks) * (1.0 - SOGLIA_MINIMA_RISULTATI)))
+        ):
+            max_safe_deletions = max(1, int(len(current_db_decks) * (1.0 - SOGLIA_MINIMA_RISULTATI)))
+            logging.warning(
+                "[SAFETY] Rilevate %s rimozioni oltre la soglia sicura (%s su %s mazzi): "
+                "possibile drift di paginazione; rimozione non-blacklist saltata.",
+                len(missing_non_blacklisted),
+                max_safe_deletions,
+                len(current_db_decks),
+            )
+            final_removed_ids = blacklisted_to_remove
+        else:
+            final_removed_ids = blacklisted_to_remove + missing_non_blacklisted
         for chunk in _chunks(final_removed_ids, 500):
             placeholders = ",".join("?" * len(chunk))
             cursor.execute(f"DELETE FROM decks WHERE id_moxfield IN ({placeholders})", chunk)

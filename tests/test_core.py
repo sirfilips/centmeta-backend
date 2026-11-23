@@ -100,6 +100,140 @@ class TestMasterScraper(unittest.TestCase):
                 self.assertFalse(result)
                 self.assertEqual(mock_get.call_count, 4)
 
+    def test_truncated_search_skips_hard_delete_but_keeps_blacklist_and_updates(self):
+        class _JsonResp:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_file = os.path.join(tmpdir, "truncated.db")
+            master_scraper.init_db(db_file)
+            conn = sqlite3.connect(db_file)
+            conn.executemany(
+                "INSERT INTO decks (id_moxfield, comandante, data_aggiornamento) VALUES (?, ?, ?)",
+                [
+                    ("keep_missing", "Kraum", "2026-01-01"),
+                    ("blk1", "Yoshimaru", "2026-01-01"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO deck_cards (deck_id, card_name) VALUES (?, ?)",
+                [
+                    ("keep_missing", "Lightning Bolt"),
+                    ("blk1", "Sol Ring"),
+                ],
+            )
+            conn.execute("INSERT INTO blacklist (id_moxfield, data_rimozione) VALUES ('blk1', '2026-01-02')")
+            conn.commit()
+            conn.close()
+
+            def _fake_get(url, params=None, headers=None, timeout=15):
+                if "decks/search" in url:
+                    return _JsonResp(
+                        200,
+                        {
+                            "totalResults": 10000,
+                            "totalPages": 1,
+                            "data": [{"publicId": "new1", "lastUpdatedAtUtc": "2026-11-23T00:00:00Z"}],
+                        },
+                    )
+                if "decks/all/new1" in url:
+                    return _JsonResp(
+                        200,
+                        {
+                            "lastUpdatedAtUtc": "2026-11-23T00:00:00Z",
+                            "boards": {
+                                "commanders": {"cards": {"c1": {"card": {"name": "Atraxa, Grand Unifier"}}}},
+                                "mainboard": {"cards": {"m1": {"card": {"name": "Brainstorm"}}}},
+                            },
+                        },
+                    )
+                raise AssertionError(f"URL inatteso: {url}")
+
+            with (
+                patch.object(master_scraper, "db_path", db_file),
+                patch.object(master_scraper, "json_path", os.path.join(tmpdir, "missing.json")),
+                patch.object(master_scraper, "rate_limited_get", side_effect=_fake_get),
+                patch.dict(os.environ, {"MOXFIELD_UA": "CentMetaTest/1.0"}, clear=False),
+            ):
+                result = master_scraper._run_scraper_locked()
+                self.assertTrue(result)
+
+            check = sqlite3.connect(db_file)
+            deck_ids = {r[0] for r in check.execute("SELECT id_moxfield FROM decks").fetchall()}
+            card_pairs = set(check.execute("SELECT deck_id, card_name FROM deck_cards").fetchall())
+            check.close()
+
+            self.assertIn("keep_missing", deck_ids)
+            self.assertIn("new1", deck_ids)
+            self.assertNotIn("blk1", deck_ids)
+            self.assertIn(("keep_missing", "Lightning Bolt"), card_pairs)
+            self.assertIn(("new1", "Brainstorm"), card_pairs)
+            self.assertNotIn(("blk1", "Sol Ring"), card_pairs)
+
+    def test_complete_search_removes_deleted_decks_normally(self):
+        class _JsonResp:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_file = os.path.join(tmpdir, "complete.db")
+            master_scraper.init_db(db_file)
+            conn = sqlite3.connect(db_file)
+            conn.executemany(
+                "INSERT INTO decks (id_moxfield, comandante, data_aggiornamento) VALUES (?, ?, ?)",
+                [
+                    ("keep1", "Kraum", "2026-11-20T00:00:00Z"),
+                    ("old1", "Yoshimaru", "2026-01-01T00:00:00Z"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO deck_cards (deck_id, card_name) VALUES (?, ?)",
+                [
+                    ("keep1", "Lightning Bolt"),
+                    ("old1", "Sol Ring"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            def _fake_get(url, params=None, headers=None, timeout=15):
+                if "decks/search" in url:
+                    return _JsonResp(
+                        200,
+                        {
+                            "totalResults": 1,
+                            "totalPages": 1,
+                            "data": [{"publicId": "keep1", "lastUpdatedAtUtc": "2026-11-20T00:00:00Z"}],
+                        },
+                    )
+                raise AssertionError(f"URL inatteso: {url}")
+
+            with (
+                patch.object(master_scraper, "db_path", db_file),
+                patch.object(master_scraper, "json_path", os.path.join(tmpdir, "missing.json")),
+                patch.object(master_scraper, "rate_limited_get", side_effect=_fake_get),
+                patch.dict(os.environ, {"MOXFIELD_UA": "CentMetaTest/1.0"}, clear=False),
+            ):
+                result = master_scraper._run_scraper_locked()
+                self.assertTrue(result)
+
+            check = sqlite3.connect(db_file)
+            deck_ids = {r[0] for r in check.execute("SELECT id_moxfield FROM decks").fetchall()}
+            card_pairs = set(check.execute("SELECT deck_id, card_name FROM deck_cards").fetchall())
+            check.close()
+
+            self.assertEqual(deck_ids, {"keep1"})
+            self.assertEqual(card_pairs, {("keep1", "Lightning Bolt")})
+
 
 class TestClientIpResolution(unittest.TestCase):
     @staticmethod

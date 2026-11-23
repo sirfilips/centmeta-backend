@@ -154,6 +154,13 @@ def ensure_daily_caches_fresh():
         clear_all_caches()
         _LAST_CACHE_DATE = today_str
 
+async def ensure_daily_caches_fresh_async():
+    """Versione non bloccante per endpoint async: delega l'eventuale invalidazione al threadpool."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if _LAST_CACHE_DATE == today_str:
+        return
+    await run_in_threadpool(ensure_daily_caches_fresh)
+
 def setup_health_db(init_main_blacklist: bool = True):
     if init_main_blacklist:
         conn = get_db()
@@ -566,7 +573,7 @@ def _parse_scryfall_card_object(card: dict) -> dict:
 def _is_valid_cached_card(entry: Optional[dict]) -> bool:
     if not entry or not entry.get("images"):
         return False
-    if entry.get("type") in ("Card", " Card // Card"):
+    if entry.get("type") in ("Card", "Card // Card", " Card // Card"):
         return False
     return True
 
@@ -848,7 +855,7 @@ def fetch_scryfall_data(card_names):
     new_entries: Dict[str, dict] = {}
     with _scryfall_lock:
         # Rimuove eventuali voci corrotte "Card" (Jumpstart theme cards)
-        for bad_key in [k for k, v in results.items() if v.get("type") in ("Card", " Card // Card")]:
+        for bad_key in [k for k, v in results.items() if v.get("type") in ("Card", "Card // Card", " Card // Card")]:
             del results[bad_key]
             bad_keys_to_delete.append(bad_key)
             cache_updated_locally = True
@@ -1663,15 +1670,17 @@ def get_dashboard_data_cached(filtro_tempo: str):
         }
         expansion_raw_list.append((combined_exp_meta, all_exp_df, len(curr_all_exp_rows)))
 
+    # Risolvi i metadati Scryfall prima di classificare i ruoli funzionali, così anche le carte nuove hanno l'oracle text
+    scryfall_cache = fetch_scryfall_data(list(all_names))
+
     # Calcolo sezioni per ruolo funzionale (Removal, Botti, Counterspell, Card Draw, ecc.)
-    scryfall_cache_roles = load_scryfall_cache()
     card_roles_cache: Dict[str, List[str]] = {}
 
     def _get_card_roles(c_name: str) -> List[str]:
         cached_r = card_roles_cache.get(c_name)
         if cached_r is not None:
             return cached_r
-        info = lookup_card_info(scryfall_cache_roles, c_name)
+        info = lookup_card_info(scryfall_cache, c_name)
         r_list = scryfall_search.classify_card_roles(info)
         card_roles_cache[c_name] = r_list
         return r_list
@@ -1691,6 +1700,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
                 role_prev_ranks[role_key][c_name] = role_prev_counters[role_key]
 
     role_raw_list = []
+    extra_role_names: List[str] = []
     for role_meta in scryfall_search.ROLE_DEFINITIONS:
         r_key = role_meta["key"]
         curr_r = role_curr_rows[r_key]
@@ -1703,10 +1713,13 @@ def get_dashboard_data_cached(filtro_tempo: str):
             else:
                 trend = ""
             role_df.append({"card_name": c_name, "freq": r["freq"], "trend": trend})
-            all_names.add(c_name)
+            if c_name not in all_names:
+                extra_role_names.append(c_name)
+                all_names.add(c_name)
         role_raw_list.append((role_meta, role_df, len(curr_r)))
     
-    scryfall_cache = fetch_scryfall_data(list(all_names))
+    if extra_role_names:
+        scryfall_cache = fetch_scryfall_data(extra_role_names)
 
     def format_item(row, name_col, is_cmd=False):
         name = row[name_col]
@@ -1760,7 +1773,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
         if colors_val is not None:
             item_out["colors"] = colors_val
         if not is_cmd:
-            item_out["roles"] = _get_card_roles(name)
+            item_out["roles"] = scryfall_search.classify_card_roles(main_info)
         return item_out
 
     try:
@@ -1963,7 +1976,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
     total_decks_global = global_cards.get(card_name, 0)
 
     scryfall_cache = load_scryfall_cache()
-    if total_decks_global > 0 and not lookup_card_info(scryfall_cache, card_name):
+    if total_decks_global > 0 and not _is_valid_cached_card(lookup_card_info(scryfall_cache, card_name)):
         scryfall_cache = fetch_scryfall_data([card_name])
     card_info_cache = lookup_card_info(scryfall_cache, card_name)
 
@@ -2120,31 +2133,27 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
     }
 
 @lru_cache(maxsize=256)
-def get_commander_decks_cached(comandante: str, filtro_tempo: str, limit: int = 0, offset: int = 0):
+def get_commander_decks_cached(comandante: str, filtro_tempo: str):
     valid_all, _ = get_global_commanders_validity()
     if comandante not in valid_all:
         return []
 
     conn = get_db()
-    c = conn.cursor()
-    conds = ["comandante = ?"]
-    t_cond = get_time_condition(filtro_tempo)
-    params = [comandante]
-    
-    if t_cond:
-        conds.append(t_cond)
-        
-    where_clause = " WHERE " + " AND ".join(conds)
-    
-    if limit > 0:
-        query = f"SELECT id_moxfield, data_aggiornamento FROM decks {where_clause} ORDER BY data_aggiornamento DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-    else:
+    try:
+        c = conn.cursor()
+        conds = ["comandante = ?"]
+        t_cond = get_time_condition(filtro_tempo)
+        params = [comandante]
+
+        if t_cond:
+            conds.append(t_cond)
+
+        where_clause = " WHERE " + " AND ".join(conds)
         query = f"SELECT id_moxfield, data_aggiornamento FROM decks {where_clause} ORDER BY data_aggiornamento DESC"
-        
-    df = c.execute(query, params).fetchall()
-    conn.close()
-    
+        df = c.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
     decks = []
     for row in df:
         decks.append({
@@ -2154,26 +2163,49 @@ def get_commander_decks_cached(comandante: str, filtro_tempo: str, limit: int = 
         })
     return decks
 
+def _get_commander_decks_safe(comandante: str, filtro_tempo: str, limit: int = 0, offset: int = 0):
+    valid_all, _ = get_global_commanders_validity()
+    if not valid_all or comandante not in valid_all:
+        return []
+    decks = get_commander_decks_cached(comandante, filtro_tempo)
+    if limit > 0:
+        return list(decks[offset : offset + limit])
+    if offset > 0:
+        return list(decks[offset:])
+    return list(decks)
+
 VALID_PERIODS = {"Ultimi 7 giorni", "Ultimi 30 giorni", "Ultimi 3 mesi", "Ultimi 6 mesi", "Ultimo anno", "Tutti i tempi"}
 
 def normalize_period(p: str) -> str:
     return p if p in VALID_PERIODS else "Tutti i tempi"
 
+def _get_decks_stats_safe(filtro_tempo: str, comandante: Optional[str]):
+    if comandante is not None:
+        valid_all, _ = get_global_commanders_validity()
+        if not valid_all or comandante not in valid_all:
+            try:
+                mtime = get_db_mtime()
+                last_updated = datetime.fromtimestamp(mtime).isoformat() if mtime else None
+            except Exception:
+                last_updated = None
+            return {"total_decks": 0, "last_updated": last_updated, "mana_curve": {}, "cards": []}
+    return get_decks_stats_cached(filtro_tempo, comandante)
+
 @app.get("/api/commanders")
 async def get_commanders(filtro_tempo: str = "Tutti i tempi"):
-    ensure_daily_caches_fresh()
+    await ensure_daily_caches_fresh_async()
     filtro_tempo = normalize_period(filtro_tempo)
     _, result_list = await run_in_threadpool(get_valid_commanders_set, filtro_tempo)
     return result_list
 
 @app.get("/api/decks/stats")
 async def get_decks_stats(filtro_tempo: str = "Tutti i tempi", comandante: Optional[str] = None, limit: int = 0, offset: int = 0):
-    ensure_daily_caches_fresh()
+    await ensure_daily_caches_fresh_async()
     filtro_tempo = normalize_period(filtro_tempo)
     limit = max(0, min(limit, 500))
     offset = max(0, offset)
     
-    data = await run_in_threadpool(get_decks_stats_cached, filtro_tempo, comandante)
+    data = await run_in_threadpool(_get_decks_stats_safe, filtro_tempo, comandante)
     
     # Se è richiesta paginazione (limit > 0 o offset > 0), facciamo slice senza toccare il dict originale in cache
     if limit > 0 or offset > 0:
@@ -2221,21 +2253,21 @@ def _get_card_details_safe(card_name: str, filtro_tempo: str):
 
 @app.get("/api/card/details")
 async def get_card_details(card_name: str, filtro_tempo: str = "Tutti i tempi"):
-    ensure_daily_caches_fresh()
+    await ensure_daily_caches_fresh_async()
     filtro_tempo = normalize_period(filtro_tempo)
     return await run_in_threadpool(_get_card_details_safe, card_name, filtro_tempo)
 
 @app.get("/api/commander/decks")
 async def get_commander_decks(comandante: str, filtro_tempo: str = "Tutti i tempi", limit: int = 0, offset: int = 0):
-    ensure_daily_caches_fresh()
+    await ensure_daily_caches_fresh_async()
     filtro_tempo = normalize_period(filtro_tempo)
     limit = max(0, min(limit, 500))
     offset = max(0, offset)
-    return await run_in_threadpool(get_commander_decks_cached, comandante, filtro_tempo, limit, offset)
+    return await run_in_threadpool(_get_commander_decks_safe, comandante, filtro_tempo, limit, offset)
 
 @app.get("/api/home/dashboard")
 async def get_dashboard(filtro_tempo: str = "Tutti i tempi"):
-    ensure_daily_caches_fresh()
+    await ensure_daily_caches_fresh_async()
     filtro_tempo = normalize_period(filtro_tempo)
     return await run_in_threadpool(get_dashboard_data_cached, filtro_tempo)
 
@@ -2268,7 +2300,7 @@ def get_metagame_history_cached(granularity: str = "month", months: int = 12, to
     try:
         c = conn.cursor()
         bucket_expr = (
-            "date(data_aggiornamento, 'weekday 1', '-7 days')"
+            "date(data_aggiornamento, '-6 days', 'weekday 1')"
             if granularity == "week"
             else "substr(data_aggiornamento, 1, 7)"
         )
@@ -2463,14 +2495,16 @@ def get_metagame_history_cached(granularity: str = "month", months: int = 12, to
 
 @app.get("/api/metagame/history")
 async def get_metagame_history(granularity: str = "month", months: int = 12, top_n: int = 6):
-    ensure_daily_caches_fresh()
+    await ensure_daily_caches_fresh_async()
+    granularity = "week" if granularity == "week" else "month"
+    months = max(3, min(int(months), 24))
+    top_n = max(3, min(int(top_n), 8))
     return await run_in_threadpool(get_metagame_history_cached, granularity, months, top_n)
 
-@app.get("/api/health")
-async def get_health_status():
+def _get_health_status_sync():
     try:
         mtime = get_db_mtime()
-        db_last_updated = datetime.fromtimestamp(mtime).isoformat()
+        db_last_updated = datetime.fromtimestamp(mtime).isoformat() if mtime else None
     except Exception:
         db_last_updated = None
 
@@ -2497,6 +2531,10 @@ async def get_health_status():
         "db_last_updated": db_last_updated,
         "history": history
     }
+
+@app.get("/api/health")
+async def get_health_status():
+    return await run_in_threadpool(_get_health_status_sync)
 
 def _clean_ip(ip_str: Optional[str]) -> Optional[str]:
     if not ip_str:
@@ -2600,6 +2638,21 @@ def _record_admin_failure(request: Request):
         failures.append(now_ts)
         _ADMIN_FAILURES[ip_key] = failures
 
+_DECK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+def _remove_deck_sync(deck_id: str):
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM deck_cards WHERE deck_id = ?", (deck_id,))
+        c.execute("DELETE FROM decks WHERE id_moxfield = ?", (deck_id,))
+        now = datetime.now().isoformat()
+        c.execute("INSERT OR IGNORE INTO blacklist (id_moxfield, data_rimozione) VALUES (?, ?)", (deck_id, now))
+        conn.commit()
+        clear_all_caches()
+    finally:
+        conn.close()
+
 @app.delete("/api/admin/remove-deck/{deck_id}", include_in_schema=False)
 async def remove_deck(
     request: Request,
@@ -2616,21 +2669,13 @@ async def remove_deck(
     if not secrets.compare_digest(x_admin_secret.encode('utf-8'), admin_password.encode('utf-8')):
         _record_admin_failure(request)
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
+
+    if not _DECK_ID_RE.fullmatch(deck_id):
+        raise HTTPException(status_code=400, detail="ID mazzo non valido")
         
-    conn = get_db()
-    c = conn.cursor()
     try:
-        c.execute("DELETE FROM deck_cards WHERE deck_id = ?", (deck_id,))
-        c.execute("DELETE FROM decks WHERE id_moxfield = ?", (deck_id,))
-        now = datetime.now().isoformat()
-        c.execute("INSERT OR IGNORE INTO blacklist (id_moxfield, data_rimozione) VALUES (?, ?)", (deck_id, now))
-        conn.commit()
-        
-        clear_all_caches()
-        
+        await run_in_threadpool(_remove_deck_sync, deck_id)
         return {"status": "success", "message": f"Mazzo {deck_id} rimosso e aggiunto alla blacklist."}
     except Exception as e:
         logging.error(f"[ADMIN ERROR] Errore rimozione mazzo {deck_id}: {e}")
         raise HTTPException(status_code=500, detail="Errore interno durante l'operazione")
-    finally:
-        conn.close()

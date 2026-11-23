@@ -45,7 +45,7 @@ PID_FRONTEND=""
 stop_all() {
   trap - SIGINT SIGTERM
   log "Arresto in corso..."
-  if [[ -f "$BASE_DIR/scraper.lock" ]]; then
+  if [[ -f "$BASE_DIR/scraper.lock" ]] && command -v flock >/dev/null 2>&1 && ! flock -n "$BASE_DIR/scraper.lock" true 2>/dev/null; then
     log "ATTENZIONE: Scraper attivo rilevato: attesa fino a ${STOP_TIMEOUT}s per chiusura transazione pulita."
   fi
   for pid in $PID_BACKEND $PID_FRONTEND; do

@@ -59,6 +59,48 @@ class TestMasterScraper(unittest.TestCase):
             conn.close()
             self.assertEqual([r[0] for r in rows], ["keep1"])
 
+    def test_step2_db_read_error_aborts_scraper(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_file = os.path.join(tmpdir, "broken.db")
+            # Crea un DB esistente ma senza le tabelle decks/blacklist
+            conn = sqlite3.connect(db_file)
+            conn.execute("CREATE TABLE other (x INTEGER)")
+            conn.commit()
+            conn.close()
+
+            with (
+                patch.object(master_scraper, "db_path", db_file),
+                patch.object(master_scraper, "json_path", os.path.join(tmpdir, "missing.json")),
+                patch.object(master_scraper, "init_db", return_value=None),
+                patch.object(master_scraper, "rate_limited_get") as mock_get,
+                patch.dict(os.environ, {"MOXFIELD_UA": "CentMetaTest/1.0"}, clear=False),
+            ):
+                result = master_scraper._run_scraper_locked()
+                self.assertFalse(result)
+                self.assertEqual(mock_get.call_count, 0)
+
+    def test_search_malformed_json_200_retries_and_aborts_cleanly(self):
+        class _BadJsonResp:
+            status_code = 200
+
+            def json(self):
+                raise ValueError("Invalid JSON body")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_file = os.path.join(tmpdir, "ok.db")
+            master_scraper.init_db(db_file)
+
+            with (
+                patch.object(master_scraper, "db_path", db_file),
+                patch.object(master_scraper, "json_path", os.path.join(tmpdir, "missing.json")),
+                patch.object(master_scraper, "rate_limited_get", return_value=_BadJsonResp()) as mock_get,
+                patch.object(master_scraper.time, "sleep", return_value=None),
+                patch.dict(os.environ, {"MOXFIELD_UA": "CentMetaTest/1.0"}, clear=False),
+            ):
+                result = master_scraper._run_scraper_locked()
+                self.assertFalse(result)
+                self.assertEqual(mock_get.call_count, 4)
+
 
 class TestClientIpResolution(unittest.TestCase):
     @staticmethod
@@ -441,6 +483,55 @@ class TestMetagameHistory(unittest.TestCase):
             self.assertEqual(weekly["granularity"], "week")
             self.assertGreaterEqual(len(weekly["buckets"]), 2)
 
+    def test_weekly_bucket_keeps_monday_in_same_week(self):
+        from datetime import timedelta
+
+        now = main.datetime.now()
+        days_since_monday = now.weekday()
+        # Usa il lunedì della settimana scorsa (così Monday..Wednesday rientrano sempre nel passato)
+        last_monday = (now - timedelta(days=days_since_monday + 7)).replace(hour=12, minute=0, second=0, microsecond=0)
+        same_week_wed = last_monday + timedelta(days=2)
+        expected_monday_key = last_monday.strftime("%Y-%m-%d")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            main_db = os.path.join(tmpdir, "centurion.db")
+            conn = sqlite3.connect(main_db)
+            conn.execute(
+                "CREATE TABLE decks (id_moxfield TEXT PRIMARY KEY, comandante TEXT, data_aggiornamento TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO decks VALUES (?, ?, ?)",
+                [
+                    ("mon1", "Kraum", last_monday.strftime("%Y-%m-%dT%H:%M:%S")),
+                    ("wed1", "Kraum", same_week_wed.strftime("%Y-%m-%dT%H:%M:%S")),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            def _get_test_db():
+                c = sqlite3.connect(main_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            fake_scryfall = {
+                "Kraum": {"cmc": 5, "type": "Legendary Creature", "color_identity": ["U", "R"], "images": ["https://img/k.jpg"]},
+            }
+
+            main.get_metagame_history_cached.cache_clear()
+            with (
+                patch.object(main, "get_db", side_effect=_get_test_db),
+                patch.object(main, "fetch_scryfall_data", return_value=fake_scryfall),
+                patch.object(main, "get_global_commanders_validity", return_value=(frozenset({"Kraum"}), ())),
+                patch.object(main, "get_global_cards_stats", return_value=(2, {})),
+                patch.object(main, "get_db_mtime", return_value=1700000000.0),
+            ):
+                weekly = main.get_metagame_history_cached("week", 3, 5)
+                main.get_metagame_history_cached.cache_clear()
+
+            self.assertEqual([b["period"] for b in weekly["buckets"]], [expected_monday_key])
+            self.assertEqual(weekly["buckets"][0]["total_decks"], 2)
+
 
 class TestScryfallRateLimitPacing(unittest.TestCase):
     def test_wait_scryfall_rate_limit_spaces_calls(self):
@@ -625,6 +716,68 @@ class TestRoleClassificationAndScryfallSearch(unittest.TestCase):
             self.assertEqual([c["name"] for c in by_role["burn"]["cards"]], ["Lightning Bolt"])
             # Brainstorm è solo nei 90 giorni fa, non negli ultimi 30 giorni
             self.assertEqual(by_role["card_draw"]["cards"], [])
+
+    def test_dashboard_role_categories_classifies_freshly_fetched_cards(self):
+        from datetime import timedelta
+
+        now = main.datetime.now()
+        d_new = (now - timedelta(days=1)).strftime("%Y-%m-%dT12:00:00")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            main_db = os.path.join(tmpdir, "centurion.db")
+            conn = sqlite3.connect(main_db)
+            conn.execute("CREATE TABLE decks (id_moxfield TEXT PRIMARY KEY, comandante TEXT, data_aggiornamento TEXT)")
+            conn.execute("CREATE TABLE deck_cards (deck_id TEXT, card_name TEXT)")
+            conn.execute("INSERT INTO decks VALUES ('d1', 'Kraum', ?)", (d_new,))
+            conn.execute("INSERT INTO deck_cards VALUES ('d1', 'Lightning Bolt')")
+            conn.commit()
+            conn.close()
+
+            def _get_test_db():
+                c = sqlite3.connect(main_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            fake_scryfall = {
+                "kraum": {"cmc": 5, "type": "Legendary Creature", "color_identity": ["U", "R"], "images": ["https://img/k.jpg"], "oracles": ["Flying"]},
+                "lightning bolt": {"cmc": 1, "type": "Instant", "color_identity": ["R"], "images": ["https://img/lb.jpg"], "oracles": ["Lightning Bolt deals 3 damage to any target."]},
+            }
+
+            main.get_dashboard_data_cached.cache_clear()
+            with (
+                patch.object(main, "get_db", side_effect=_get_test_db),
+                patch.object(main, "load_scryfall_cache", return_value={}),
+                patch.object(main, "fetch_scryfall_data", return_value=fake_scryfall),
+                patch.object(main, "get_global_commanders_validity", return_value=(frozenset({"Kraum"}), ())),
+                patch.object(main, "get_recent_expansions_metadata", return_value=[]),
+                patch.object(main, "get_db_mtime", return_value=1700000000.0),
+            ):
+                dash_30d = main.get_dashboard_data_cached("Ultimi 30 giorni")
+                main.get_dashboard_data_cached.cache_clear()
+
+            by_role = {r["key"]: r for r in dash_30d["role_categories"]}
+            self.assertEqual([c["name"] for c in by_role["burn"]["cards"]], ["Lightning Bolt"])
+            self.assertEqual([c["name"] for c in by_role["removal"]["cards"]], ["Lightning Bolt"])
+
+    def test_invalid_commander_does_not_pollute_lru_caches(self):
+        main.get_decks_stats_cached.cache_clear()
+        main.get_commander_decks_cached.cache_clear()
+        try:
+            with (
+                patch.object(main, "get_global_commanders_validity", return_value=(frozenset({"Kraum"}), ())),
+                patch.object(main, "get_db_mtime", return_value=1700000000.0),
+            ):
+                stats = main._get_decks_stats_safe("Ultimi 30 giorni", "Comandante Inesistente XYZ")
+                decks = main._get_commander_decks_safe("Comandante Inesistente XYZ", "Ultimi 30 giorni", 10, 0)
+
+            self.assertEqual(stats["total_decks"], 0)
+            self.assertEqual(stats["cards"], [])
+            self.assertEqual(decks, [])
+            self.assertEqual(main.get_decks_stats_cached.cache_info().currsize, 0)
+            self.assertEqual(main.get_commander_decks_cached.cache_info().currsize, 0)
+        finally:
+            main.get_decks_stats_cached.cache_clear()
+            main.get_commander_decks_cached.cache_clear()
 
 
 if __name__ == "__main__":

@@ -355,6 +355,8 @@ def _run_scraper_locked() -> bool:
     # 2. LETTURA STATO ATTUALE (Snapshot Veloce DB)
     db_decks = {}
     blacklisted_ids = set()
+    db_exists = os.path.exists(db_path)
+    conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=30)
         conn.execute("PRAGMA busy_timeout = 30000;")
@@ -364,9 +366,17 @@ def _run_scraper_locked() -> bool:
             db_decks[row[0]] = str(row[1]).strip() if row[1] else None
         cursor.execute("SELECT id_moxfield FROM blacklist")
         blacklisted_ids = {row[0] for row in cursor.fetchall()}
-        conn.close()
     except Exception as e:
+        if db_exists:
+            logging.error(f"Impossibile leggere lo stato del DB locale '{db_path}': {e}. Interruzione per sicurezza.")
+            return False
         logging.warning(f"Impossibile leggere lo stato del DB locale: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # 3. RICERCA PAGINATA (con deduplica publicId e uscita anticipata)
     logging.info("Cerco i mazzi per CentMeta su Moxfield...")
@@ -382,10 +392,15 @@ def _run_scraper_locked() -> bool:
         params = {"pageNumber": page, "pageSize": page_size, "fmt": "centurion"}
         success = False
         
+        data = []
         for attempt in range(4):
             try:
                 response = rate_limited_get(search_url, params=params, timeout=10)
                 if response.status_code == 200:
+                    body = response.json()
+                    if not isinstance(body, dict):
+                        raise ValueError("Risposta JSON non valida dalla ricerca Moxfield")
+                    data = body.get("data", [])
                     success = True
                     break
                 elif response.status_code == 429:
@@ -409,7 +424,6 @@ def _run_scraper_locked() -> bool:
             search_failed = True
             break
             
-        data = response.json().get("data", [])
         if not data:
             break
             
@@ -541,11 +555,12 @@ def _run_scraper_locked() -> bool:
             logging.warning(f"Impossibile completare lo snapshot di backup preventivo: {b_err}")
 
     logging.info("Avvio scrittura incrementale nel DB (Transazione sicura)...")
-    conn = sqlite3.connect(db_path, timeout=30)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout = 30000;")
     try:
         cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
         
         # (a) Rileggi blacklist in caso di modifiche runtime dell'admin
         cursor.execute("SELECT id_moxfield FROM blacklist")
@@ -581,7 +596,7 @@ def _run_scraper_locked() -> bool:
                 cursor.executemany("INSERT INTO deck_cards (deck_id, card_name) VALUES (?, ?)", cards_to_insert)
                 
         cursor.execute("ANALYZE")
-        conn.commit()
+        cursor.execute("COMMIT")
         
         # (e) Tocco l'mtime del file solo ad aggiornamento effettivamente completato
         try:
@@ -599,7 +614,11 @@ def _run_scraper_locked() -> bool:
         logging.info("Finito! I dati incrementali sono pronti per CentMeta.")
         return True
     except Exception as e:
-        conn.rollback()
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
         logging.error(f"Errore critico durante la scrittura nel DB: {type(e).__name__} - {e}. Rollback effettuato.")
         return False
     finally:

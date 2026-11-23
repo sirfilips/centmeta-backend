@@ -367,6 +367,88 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
                     ],
                 )
 
+    def test_iter_json_array_objects_streams_across_small_chunks(self):
+        import io
+
+        payload = json.dumps(
+            [
+                {"id": "1", "name": "Lightning Bolt", "meta": {"tags": ["burn", "a\"b"]}},
+                {"id": "2", "name": "Opt", "artist": "John Avon"},
+                {"id": "3", "name": "Dark Ritual"},
+            ],
+            indent=2,
+        )
+        items = list(main._iter_json_array_objects(io.StringIO(payload), chunk_size=17))
+        self.assertEqual([x["name"] for x in items], ["Lightning Bolt", "Opt", "Dark Ritual"])
+        self.assertEqual(items[0]["meta"]["tags"], ["burn", 'a"b'])
+        self.assertEqual(list(main._iter_json_array_objects(io.StringIO("  [ \n ] "), chunk_size=3)), [])
+
+    def test_backfill_scryfall_artists_from_bulk_json_array_streaming(self):
+        uuid_target = "11111111-2222-3333-4444-555555555555"
+        array_bytes = json.dumps([
+            {"id": "99999999-8888-7777-6666-555555555555", "name": "Opt", "artist": "Wrong Artist"},
+            {"id": uuid_target, "name": "Opt", "artist": "John Avon"},
+            {"id": "aaaaaaaa-0000-0000-0000-000000000001", "name": "Dark Ritual", "artist": "Sandra Everingham"},
+        ]).encode("utf-8")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cache_file = os.path.join(tmpdir, "scryfall_cache.json")
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "opt": {
+                        "full_name": "Opt",
+                        "images": [f"https://cards.scryfall.io/normal/front/1/1/{uuid_target}.jpg"],
+                        "art_crops": [f"https://cards.scryfall.io/art_crop/front/1/1/{uuid_target}.jpg"],
+                        "type": "Instant",
+                    },
+                    "dark ritual": {
+                        "full_name": "Dark Ritual",
+                        "images": ["https://example.invalid/no-uuid.jpg"],
+                        "art_crops": ["https://example.invalid/no-uuid-art.jpg"],
+                        "type": "Instant",
+                    },
+                }, f)
+
+            class _FakeArrayResp:
+                status_code = 200
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def iter_content(self, chunk_size=65536):
+                    yield array_bytes[:25]
+                    yield array_bytes[25:]
+
+            class _FakeSession:
+                def get(self, url, stream=False, timeout=15):
+                    if "bulk-data/default-cards" in url:
+                        return SimpleNamespace(
+                            status_code=200,
+                            json=lambda: {"download_uri": "https://data.scryfall.io/default-cards/test.json"},
+                        )
+                    return _FakeArrayResp()
+
+            with (
+                patch.object(main, "CACHE_FILE", cache_file),
+                patch.object(main, "_SCRYFALL_CACHE_MEMORY", None),
+                patch.object(main, "get_scryfall_session", return_value=_FakeSession()),
+                patch.object(main, "_wait_scryfall_rate_limit", return_value=None),
+            ):
+                targets = main.collect_missing_artist_targets()
+                updates = main.backfill_scryfall_artists_from_bulk(targets)
+                self.assertEqual(updates["opt"]["artist"], "John Avon")
+                self.assertEqual(updates["dark ritual"]["artist"], "Sandra Everingham")
+
+    def test_cors_origins_excludes_localhost_by_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ALLOW_LOCALHOST_CORS", None)
+            os.environ.pop("CORS_ALLOW_ORIGINS", None)
+            origins = main._get_cors_allow_origins()
+            self.assertEqual(origins, ["https://centmeta.it", "https://www.centmeta.it"])
+
+        with patch.dict(os.environ, {"ALLOW_LOCALHOST_CORS": "1", "CORS_ALLOW_ORIGINS": "https://staging.centmeta.it/"}, clear=False):
+            origins_dev = main._get_cors_allow_origins()
+            self.assertIn("http://localhost:3000", origins_dev)
+            self.assertIn("https://staging.centmeta.it", origins_dev)
+
 
 class TestMdfcAndDailyCacheFreshness(unittest.TestCase):
     def test_mdfc_spell_land_included_in_mana_curve(self):

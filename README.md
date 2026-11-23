@@ -78,6 +78,8 @@ python -m pip install -r requirements.txt
 | `SCRAPER_DRY_RUN` | No | Se vale `1`, lo scraper calcola le differenze senza scaricare né salvare nulla. |
 | `SCRAPER_FORCE` | No | Se vale `1`, salta il controllo di sicurezza sulla soglia minima dei risultati. |
 | `ALLOW_JSON_IMPORT` | No | Se vale `1`, autorizza la conversione distruttiva una-tantum da `database_centurion.json` verso SQLite. |
+| `CORS_ALLOW_ORIGINS` | No | Origini extra separate da virgola consentite dal middleware CORS (es. in staging o sviluppo locale). |
+| `ALLOW_LOCALHOST_CORS` | No | Se vale `1`, abilita `http://localhost:3000` nelle origini CORS consentite. |
 
 6. Inizializzare il database e avviare il server:
 ```bash

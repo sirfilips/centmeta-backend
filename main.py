@@ -402,16 +402,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CentMeta API", version="4.0.0", lifespan=lifespan)
 
+def _get_cors_allow_origins() -> List[str]:
+    origins = ["https://centmeta.it", "https://www.centmeta.it"]
+    extra = os.getenv("CORS_ALLOW_ORIGINS", "")
+    for item in extra.split(","):
+        origin = item.strip().rstrip("/")
+        if origin and origin not in origins:
+            origins.append(origin)
+    if os.getenv("ALLOW_LOCALHOST_CORS") == "1" and "http://localhost:3000" not in origins:
+        origins.append("http://localhost:3000")
+    return origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://centmeta.it",
-        "https://www.centmeta.it",
-        "http://localhost:3000"
-    ],
+    allow_origins=_get_cors_allow_origins(),
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type"],
 )
 
 def get_time_conditions_both(filtro_tempo: str):
@@ -674,6 +681,58 @@ def backfill_scryfall_artists_batch(batch: List[tuple[dict, List[str]]]) -> tupl
                 updates[ck] = {**existing, "artist": artist}
     return updates, False
 
+def _iter_json_array_objects(f_in, chunk_size: int = 262144):
+    """Itera in streaming gli oggetti di un array JSON `[...]` senza caricarlo interamente in RAM."""
+    decoder = json.JSONDecoder()
+    buf = ""
+    pos = 0
+    started = False
+    eof = False
+
+    def _refill() -> bool:
+        nonlocal buf, pos, eof
+        if eof:
+            return False
+        chunk = f_in.read(chunk_size)
+        if not chunk:
+            eof = True
+            return False
+        buf = buf[pos:] + chunk
+        pos = 0
+        return True
+
+    while True:
+        while True:
+            while pos < len(buf) and buf[pos].isspace():
+                pos += 1
+            if pos < len(buf):
+                break
+            if not _refill():
+                return
+
+        if not started:
+            if buf[pos] != "[":
+                raise ValueError("Il file JSON non inizia con '['")
+            started = True
+            pos += 1
+            continue
+
+        if buf[pos] == "]":
+            return
+        if buf[pos] == ",":
+            pos += 1
+            continue
+
+        while True:
+            try:
+                obj, next_pos = decoder.raw_decode(buf, pos)
+                pos = next_pos
+                yield obj
+                break
+            except json.JSONDecodeError:
+                if not _refill():
+                    raise
+
 def backfill_scryfall_artists_from_bulk(targets: List[tuple[dict, List[str]]]) -> Dict[str, dict]:
     if not targets:
         return {}
@@ -751,7 +810,7 @@ def backfill_scryfall_artists_from_bulk(targets: List[tuple[dict, List[str]]]) -
                 f_in.seek(0)
 
                 if first_char == "[":
-                    for card in json.load(f_in):
+                    for card in _iter_json_array_objects(f_in):
                         if isinstance(card, dict):
                             _process_card_obj(card)
                             if not needed_ids and not needed_names:

@@ -12,7 +12,8 @@ import threading
 import logging
 import secrets
 import hashlib
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
@@ -106,12 +107,36 @@ def setup_database_indices():
     finally:
         conn.close()
 
+try:
+    _ROME_TZ = ZoneInfo("Europe/Rome")
+except ZoneInfoNotFoundError:
+    _ROME_TZ = None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    return _utc_now().isoformat().replace("+00:00", "Z")
+
+
+def _utc_today_str() -> str:
+    return _utc_now().strftime("%Y-%m-%d")
+
+
+def _mtime_to_utc_iso(mtime: Optional[float]) -> Optional[str]:
+    if mtime is None:
+        return None
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 _scryfall_lock = threading.RLock()
 _scryfall_file_lock = threading.Lock()
 _expansions_lock = threading.RLock()
 _expansions_fetch_lock = threading.Lock()
 _daily_cache_lock = threading.Lock()
-_LAST_CACHE_DATE = datetime.now().strftime("%Y-%m-%d")
+_LAST_CACHE_DATE = _utc_today_str()
 _scryfall_rate_lock = threading.Lock()
 _scryfall_last_request_ts = 0.0
 _SCRYFALL_MISSING_CACHE = set()
@@ -144,13 +169,13 @@ def clear_all_caches():
     get_commander_decks_cached.cache_clear()
     get_dashboard_data_cached.cache_clear()
     get_metagame_history_cached.cache_clear()
-    _LAST_CACHE_DATE = datetime.now().strftime("%Y-%m-%d")
+    _LAST_CACHE_DATE = _utc_today_str()
     print("[CACHE] Tutte le cache in memoria sono state svuotate.")
 
 def ensure_daily_caches_fresh():
     """Invalida le cache @lru_cache al cambio giorno anche se lo scraper notturno non è stato eseguito."""
     global _LAST_CACHE_DATE
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = _utc_today_str()
     if _LAST_CACHE_DATE == today_str:
         return
     with _daily_cache_lock:
@@ -161,7 +186,7 @@ def ensure_daily_caches_fresh():
 
 async def ensure_daily_caches_fresh_async():
     """Versione non bloccante per endpoint async: delega l'eventuale invalidazione al threadpool."""
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = _utc_today_str()
     if _LAST_CACHE_DATE == today_str:
         return
     await run_in_threadpool(ensure_daily_caches_fresh)
@@ -196,7 +221,7 @@ def setup_health_db(init_main_blacklist: bool = True):
     finally:
         h_conn.close()
 
-def _record_service_ping(c, now: str, service: str, request_fn, redact_secret: Optional[str] = None):
+def _execute_service_ping(service: str, request_fn, redact_secret: Optional[str] = None) -> tuple[str, str, str]:
     try:
         res = request_fn()
         if res.status_code == 200:
@@ -212,75 +237,109 @@ def _record_service_ping(c, now: str, service: str, request_fn, redact_secret: O
         logging.warning(f"[HEALTH WARNING] Rilevata anomalia connessione {service}: {err_msg}")
         status = "down"
 
-    c.execute("INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)", (now, service, status))
-    c.execute("""
-        DELETE FROM health_logs 
-        WHERE service=? AND rowid NOT IN (
-            SELECT rowid FROM health_logs 
-            WHERE service=? ORDER BY timestamp DESC LIMIT 48
-        )
-    """, (service, service))
+    return (_utc_now_iso(), service, status)
+
 
 def _get_last_ping_seconds_ago(cursor, service: str) -> Optional[float]:
     row = cursor.execute(
-        "SELECT timestamp FROM health_logs WHERE service=? ORDER BY timestamp DESC LIMIT 1",
+        "SELECT timestamp FROM health_logs WHERE service=? ORDER BY rowid DESC LIMIT 1",
         (service,)
     ).fetchone()
     if not row or not row["timestamp"]:
         return None
     try:
         last_dt = datetime.fromisoformat(row["timestamp"])
-        return (datetime.now() - last_dt).total_seconds()
+        if last_dt.tzinfo is None:
+            # Retrocompatibilità con timestamp naive locali già salvati in health.db
+            last_dt = last_dt.astimezone().astimezone(timezone.utc)
+        else:
+            last_dt = last_dt.astimezone(timezone.utc)
+        return (_utc_now() - last_dt).total_seconds()
     except Exception:
         return None
 
-def _perform_health_pings():
-    setup_health_db(init_main_blacklist=False)
-    now = datetime.now().isoformat()
+
+def _save_service_pings(records: List[tuple[str, str, str]]) -> None:
+    if not records:
+        return
     conn = get_health_db()
     try:
         c = conn.cursor()
-        
-        moxfield_ua = os.getenv("MOXFIELD_UA")
-        if moxfield_ua:
-            moxfield_ua = moxfield_ua.strip()
-        
-        # 1. Ping Scryfall (salta se già eseguito negli ultimi 45 minuti da un altro worker)
-        scry_sec = _get_last_ping_seconds_ago(c, "scryfall")
-        if scry_sec is None or scry_sec >= 2700:
-            def _ping_scryfall():
-                _wait_scryfall_rate_limit()
-                return get_scryfall_session().get("https://api.scryfall.com/cards/named?exact=Sol Ring", timeout=10)
-
-            _record_service_ping(
-                c,
-                now,
-                "scryfall",
-                _ping_scryfall
+        for ping_ts, service, status in records:
+            c.execute(
+                "INSERT INTO health_logs (timestamp, service, status) VALUES (?, ?, ?)",
+                (ping_ts, service, status),
             )
-        
-        # 2. Ping Moxfield (rispetta rigidamente il rate limiter di 1.2s condiviso con lo scraper)
-        if not moxfield_ua:
-            logging.warning("[HEALTH WARNING] Variabile MOXFIELD_UA non impostata. Salto il ping a Moxfield.")
-        else:
-            mox_sec = _get_last_ping_seconds_ago(c, "moxfield")
-            if mox_sec is None or mox_sec >= 2700:
-                _record_service_ping(
-                    c,
-                    now,
-                    "moxfield",
-                    lambda: master_scraper.rate_limited_get(
-                        "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
-                        headers={"User-Agent": moxfield_ua},
-                        timeout=10
-                    ),
-                    redact_secret=moxfield_ua
+            c.execute(
+                """
+                DELETE FROM health_logs
+                WHERE service=? AND rowid NOT IN (
+                    SELECT rowid FROM health_logs
+                    WHERE service=? ORDER BY rowid DESC LIMIT 48
                 )
-        
+                """,
+                (service, service),
+            )
         conn.commit()
     finally:
         conn.close()
-    print(f"[HEALTH] Controllo stato completato alle {now}")
+
+
+def _perform_health_pings():
+    scry_sec: Optional[float] = None
+    mox_sec: Optional[float] = None
+
+    conn = get_health_db()
+    try:
+        c = conn.cursor()
+        try:
+            scry_sec = _get_last_ping_seconds_ago(c, "scryfall")
+            mox_sec = _get_last_ping_seconds_ago(c, "moxfield")
+        except sqlite3.OperationalError:
+            # Fallback se il DB health non fosse ancora stato inizializzato da lifespan
+            conn.close()
+            conn = None
+            setup_health_db(init_main_blacklist=False)
+            conn = get_health_db()
+            c = conn.cursor()
+            scry_sec = _get_last_ping_seconds_ago(c, "scryfall")
+            mox_sec = _get_last_ping_seconds_ago(c, "moxfield")
+    finally:
+        if conn is not None:
+            conn.close()
+
+    moxfield_ua = os.getenv("MOXFIELD_UA")
+    if moxfield_ua:
+        moxfield_ua = moxfield_ua.strip()
+
+    records: List[tuple[str, str, str]] = []
+
+    # 1. Ping Scryfall (fuori da qualsiasi lock/transazione DB)
+    if scry_sec is None or scry_sec >= 2700:
+        def _ping_scryfall():
+            _wait_scryfall_rate_limit()
+            return get_scryfall_session().get("https://api.scryfall.com/cards/named?exact=Sol Ring", timeout=10)
+
+        records.append(_execute_service_ping("scryfall", _ping_scryfall))
+
+    # 2. Ping Moxfield (fuori da qualsiasi lock/transazione DB)
+    if not moxfield_ua:
+        logging.warning("[HEALTH WARNING] Variabile MOXFIELD_UA non impostata. Salto il ping a Moxfield.")
+    elif mox_sec is None or mox_sec >= 2700:
+        records.append(
+            _execute_service_ping(
+                "moxfield",
+                lambda: master_scraper.rate_limited_get(
+                    "https://api.moxfield.com/v2/decks/search?pageNumber=1&pageSize=1&fmt=centurion",
+                    headers={"User-Agent": moxfield_ua},
+                    timeout=10,
+                ),
+                redact_secret=moxfield_ua,
+            )
+        )
+
+    _save_service_pings(records)
+    print(f"[HEALTH] Controllo stato completato alle {_utc_now_iso()}")
 
 async def background_health_pinger(stop_event: Optional[threading.Event] = None):
     while True:
@@ -324,17 +383,35 @@ async def warmup_caches(periodi: Optional[List[str]] = None, stop_event: Optiona
         await run_in_threadpool(get_dashboard_data_cached, periodo)
     print("[WARMUP] Pre-warming completato. Sistema pronto.")
 
+def _seconds_until_next_scrape(now_utc: Optional[datetime] = None) -> float:
+    """Calcola i secondi fino alle 23:00 Europe/Rome gestendo correttamente i cambi di ora legale (DST)."""
+    now_ref = now_utc or _utc_now()
+    if now_ref.tzinfo is None:
+        now_ref = now_ref.replace(tzinfo=timezone.utc)
+
+    if _ROME_TZ is not None:
+        now_local = now_ref.astimezone(_ROME_TZ)
+        target_date = now_local.date()
+        target_naive = datetime.combine(target_date, time(23, 0))
+        target_local = target_naive.replace(tzinfo=_ROME_TZ)
+        if now_local >= target_local:
+            target_local = datetime.combine(target_date + timedelta(days=1), time(23, 0)).replace(tzinfo=_ROME_TZ)
+        return max(0.0, (target_local.astimezone(timezone.utc) - now_ref.astimezone(timezone.utc)).total_seconds())
+
+    now_local = now_ref.astimezone()
+    target_date = now_local.date()
+    target_local = datetime.combine(target_date, time(23, 0)).astimezone()
+    if now_local >= target_local:
+        target_local = datetime.combine(target_date + timedelta(days=1), time(23, 0)).astimezone()
+    return max(0.0, (target_local.astimezone(timezone.utc) - now_ref.astimezone(timezone.utc)).total_seconds())
+
+
 async def background_db_updater(stop_event: Optional[threading.Event] = None):
     while True:
         if stop_event is not None and stop_event.is_set():
             break
         try:
-            now = datetime.now()
-            target = datetime.combine(now.date(), time(23, 0))
-            if now >= target:
-                target = target + timedelta(days=1)
-            
-            seconds_to_wait = (target - now).total_seconds()
+            seconds_to_wait = _seconds_until_next_scrape()
             print(f"[CRON] Prossimo aggiornamento alle 23:00 (tra {int(seconds_to_wait / 3600)} ore).")
             
             await asyncio.sleep(seconds_to_wait)
@@ -1421,9 +1498,9 @@ def get_recent_expansions_metadata() -> List[dict]:
     che abbiano almeno una carta giocata nel database Centurion.
     """
     global _EXPANSIONS_CACHE_MEMORY, _EXPANSIONS_CACHE_DATE
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = _utc_today_str()
     curr_mtime = get_db_mtime()
-    prerelease_cutoff = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    prerelease_cutoff = (_utc_now() + timedelta(days=7)).strftime("%Y-%m-%d")
 
     # Fast path: controllo memoria o cache disco recente protetto da lock leggero
     with _expansions_lock:
@@ -1880,7 +1957,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
 
     try:
         mtime = get_db_mtime()
-        global_last_updated = datetime.fromtimestamp(mtime).isoformat() if mtime else None
+        global_last_updated = _mtime_to_utc_iso(mtime)
     except Exception:
         global_last_updated = None
 
@@ -1921,7 +1998,7 @@ def get_dashboard_data_cached(filtro_tempo: str):
 def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
     try:
         mtime = get_db_mtime()
-        global_last_updated = datetime.fromtimestamp(mtime).isoformat()
+        global_last_updated = _mtime_to_utc_iso(mtime)
     except Exception:
         global_last_updated = None
 
@@ -2290,7 +2367,7 @@ def _get_decks_stats_safe(filtro_tempo: str, comandante: Optional[str]):
         if not valid_all or comandante not in valid_all:
             try:
                 mtime = get_db_mtime()
-                last_updated = datetime.fromtimestamp(mtime).isoformat() if mtime else None
+                last_updated = _mtime_to_utc_iso(mtime)
             except Exception:
                 last_updated = None
             return {"total_decks": 0, "last_updated": last_updated, "mana_curve": {}, "cards": []}
@@ -2576,7 +2653,7 @@ def get_metagame_history_cached(granularity: str = "month", months: int = 12, to
 
     global_total_decks, _ = get_global_cards_stats()
     try:
-        last_upd_iso = datetime.fromtimestamp(get_db_mtime()).isoformat()
+        last_upd_iso = _mtime_to_utc_iso(get_db_mtime())
     except Exception:
         last_upd_iso = None
 
@@ -2623,7 +2700,7 @@ def _get_health_status_sync():
 
     try:
         mtime = get_db_mtime()
-        db_last_updated = datetime.fromtimestamp(mtime).isoformat() if mtime else None
+        db_last_updated = _mtime_to_utc_iso(mtime)
     except Exception:
         db_last_updated = None
 
@@ -2634,7 +2711,7 @@ def _get_health_status_sync():
     h_c = h_conn.cursor()
     
     try:
-        h_c.execute("SELECT service, status, timestamp FROM health_logs ORDER BY timestamp ASC")
+        h_c.execute("SELECT service, status, timestamp FROM health_logs ORDER BY rowid ASC")
         for row in h_c.fetchall():
             service = row['service']
             if service in history:
@@ -2780,7 +2857,7 @@ def _remove_deck_sync(deck_id: str):
     try:
         c.execute("DELETE FROM deck_cards WHERE deck_id = ?", (deck_id,))
         c.execute("DELETE FROM decks WHERE id_moxfield = ?", (deck_id,))
-        now = datetime.now().isoformat()
+        now = _utc_now_iso()
         c.execute("INSERT OR IGNORE INTO blacklist (id_moxfield, data_rimozione) VALUES (?, ?)", (deck_id, now))
         conn.commit()
         clear_all_caches()

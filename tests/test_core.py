@@ -641,7 +641,7 @@ class TestMdfcAndDailyCacheFreshness(unittest.TestCase):
         ):
             main.ensure_daily_caches_fresh()
             self.assertEqual(spy_clear.call_count, 1)
-            self.assertEqual(main._LAST_CACHE_DATE, main.datetime.now().strftime("%Y-%m-%d"))
+            self.assertEqual(main._LAST_CACHE_DATE, main._utc_today_str())
 
 
 class TestMetagameHistory(unittest.TestCase):
@@ -1311,6 +1311,90 @@ class TestEndpointBehaviorAndCardDetails(unittest.TestCase):
                         asyncio.run(main.remove_deck(req_bad, "deck1", x_admin_secret="wrong"))
                     self.assertEqual(ctx.exception.status_code, 403)
                     self.assertLessEqual(len(main._ADMIN_FAILURES), 3)
+
+    def test_utc_iso_timestamps_include_z_suffix(self):
+        self.assertTrue(main._utc_now_iso().endswith("Z"))
+        self.assertEqual(main._mtime_to_utc_iso(1700000000.0), "2023-11-14T22:13:20Z")
+        self.assertIsNone(main._mtime_to_utc_iso(None))
+
+    def test_seconds_until_next_scrape_handles_rome_dst_transitions(self):
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        rome = ZoneInfo("Europe/Rome")
+        # Primavera 2026: il 29 marzo si passa da +01:00 a +02:00 alle 02:00 -> giornata da 23h
+        spring_start = datetime(2026, 3, 29, 0, 0, tzinfo=rome).astimezone(timezone.utc)
+        self.assertEqual(main._seconds_until_next_scrape(spring_start), 22 * 3600)
+
+        # Autunno 2026: il 25 ottobre si passa da +02:00 a +01:00 alle 03:00 -> giornata da 25h
+        autumn_start = datetime(2026, 10, 25, 0, 0, tzinfo=rome).astimezone(timezone.utc)
+        self.assertEqual(main._seconds_until_next_scrape(autumn_start), 24 * 3600)
+
+    def test_perform_health_pings_does_not_hold_db_lock_during_http_and_prunes_by_rowid(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            health_db = os.path.join(tmpdir, "health.db")
+            conn = sqlite3.connect(health_db)
+            conn.execute("CREATE TABLE health_logs (timestamp TEXT, service TEXT, status TEXT)")
+            # Inserisce 50 vecchi record per scryfall (uno naive vecchio + 49 vecchi) e 1 vecchio per moxfield
+            conn.executemany(
+                "INSERT INTO health_logs VALUES (?, ?, ?)",
+                [(f"2026-01-01T00:{i:02d}:00", "scryfall", "operational") for i in range(50)]
+                + [("2026-01-01T00:00:00", "moxfield", "operational")],
+            )
+            conn.commit()
+            conn.close()
+
+            def _get_test_health_db():
+                c = sqlite3.connect(health_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            concurrent_write_ok = []
+
+            class _Resp:
+                status_code = 200
+
+            class _FakeSession:
+                def get(self, *args, **kwargs):
+                    # Durante la chiamata HTTP verso Scryfall, health.db NON deve essere bloccato
+                    w_conn = sqlite3.connect(health_db, timeout=0.0)
+                    w_conn.execute("INSERT INTO health_logs VALUES ('2026-01-01T01:00:00Z', 'probe', 'operational')")
+                    w_conn.commit()
+                    w_conn.close()
+                    concurrent_write_ok.append("scryfall")
+                    return _Resp()
+
+            def _fake_mox_get(*args, **kwargs):
+                w_conn = sqlite3.connect(health_db, timeout=0.0)
+                w_conn.execute("INSERT INTO health_logs VALUES ('2026-01-01T01:00:01Z', 'probe', 'operational')")
+                w_conn.commit()
+                w_conn.close()
+                concurrent_write_ok.append("moxfield")
+                return _Resp()
+
+            with (
+                patch.object(main, "get_health_db", side_effect=_get_test_health_db),
+                patch.object(main, "get_scryfall_session", return_value=_FakeSession()),
+                patch.object(main, "_wait_scryfall_rate_limit", return_value=None),
+                patch.object(main.master_scraper, "rate_limited_get", side_effect=_fake_mox_get),
+                patch.dict(os.environ, {"MOXFIELD_UA": "CentMetaTest/1.0"}, clear=False),
+            ):
+                main._perform_health_pings()
+
+            self.assertEqual(concurrent_write_ok, ["scryfall", "moxfield"])
+
+            check = sqlite3.connect(health_db)
+            scry_rows = check.execute(
+                "SELECT timestamp, status FROM health_logs WHERE service='scryfall' ORDER BY rowid ASC"
+            ).fetchall()
+            mox_rows = check.execute(
+                "SELECT timestamp, status FROM health_logs WHERE service='moxfield' ORDER BY rowid ASC"
+            ).fetchall()
+            check.close()
+
+            self.assertEqual(len(scry_rows), 48)
+            self.assertTrue(scry_rows[-1][0].endswith("Z"))
+            self.assertTrue(mox_rows[-1][0].endswith("Z"))
 
 
 if __name__ == "__main__":

@@ -121,6 +121,27 @@ class TestScryfallCacheThreadSafety(unittest.TestCase):
                     on_disk = json.load(f)
                 self.assertEqual(list(on_disk.keys()), ["Counterspell"])
 
+    def test_commit_after_cache_clear_preserves_existing_disk_entries(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            cache_file = os.path.join(tmpdir, "scryfall_cache.json")
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({"Lightning Bolt": {"cmc": 1, "type": "Instant"}}, f)
+
+            with (
+                patch.object(main, "CACHE_FILE", cache_file),
+                patch.object(main, "_SCRYFALL_CACHE_MEMORY", None),
+            ):
+                updated = main._commit_scryfall_cache_updates(
+                    {"Counterspell": {"cmc": 2, "type": "Instant"}}
+                )
+                self.assertIn("Lightning Bolt", updated)
+                self.assertIn("Counterspell", updated)
+
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    on_disk = json.load(f)
+                self.assertIn("Lightning Bolt", on_disk)
+                self.assertIn("Counterspell", on_disk)
+
     def test_parse_scryfall_artist_and_backfill(self):
         single = main._parse_scryfall_card_object({
             "name": "Lightning Bolt",

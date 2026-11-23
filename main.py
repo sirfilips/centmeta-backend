@@ -424,65 +424,79 @@ def get_time_condition(filtro_tempo: str):
     curr, _ = get_time_conditions_both(filtro_tempo)
     return curr
 
+def _load_scryfall_cache_from_disk() -> dict:
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                return loaded if isinstance(loaded, dict) else {}
+        return {}
+    except Exception as e:
+        ts = int(std_time.time())
+        corrupt_name = f"{CACHE_FILE}.corrupt-{ts}"
+        logging.warning(f"Cache Scryfall corrotta ({e}). Rinomino in {corrupt_name} e riparto pulito.")
+        try:
+            os.replace(CACHE_FILE, corrupt_name)
+        except Exception:
+            pass
+        return {}
+
+def _write_snapshot_to_disk_locked(snapshot: dict):
+    """Scrive lo snapshot su disco in modo atomico. Richiede _scryfall_file_lock acquisito."""
+    tmp_file = f"{CACHE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp_file, CACHE_FILE)
+    except Exception as e:
+        logging.warning(f"Errore durante il salvataggio della cache Scryfall: {e}")
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
+
 def load_scryfall_cache():
     global _SCRYFALL_CACHE_MEMORY
     with _scryfall_lock:
         if _SCRYFALL_CACHE_MEMORY is not None:
             return _SCRYFALL_CACHE_MEMORY.copy()
-        try:
-            if os.path.exists(CACHE_FILE):
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                    _SCRYFALL_CACHE_MEMORY = loaded if isinstance(loaded, dict) else {}
-            else:
-                _SCRYFALL_CACHE_MEMORY = {}
-        except Exception as e:
-            ts = int(std_time.time())
-            corrupt_name = f"{CACHE_FILE}.corrupt-{ts}"
-            logging.warning(f"Cache Scryfall corrotta ({e}). Rinomino in {corrupt_name} e riparto pulito.")
-            try:
-                os.replace(CACHE_FILE, corrupt_name)
-            except Exception:
-                pass
-            _SCRYFALL_CACHE_MEMORY = {}
-        return _SCRYFALL_CACHE_MEMORY.copy()
+    with _scryfall_file_lock:
+        with _scryfall_lock:
+            if _SCRYFALL_CACHE_MEMORY is None:
+                _SCRYFALL_CACHE_MEMORY = _load_scryfall_cache_from_disk()
+            return _SCRYFALL_CACHE_MEMORY.copy()
 
 def _write_scryfall_cache_to_disk():
     with _scryfall_file_lock:
         with _scryfall_lock:
-            snapshot = (_SCRYFALL_CACHE_MEMORY or {}).copy()
-        tmp_file = f"{CACHE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
-        try:
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f)
-            os.replace(tmp_file, CACHE_FILE)
-        except Exception as e:
-            logging.warning(f"Errore durante il salvataggio della cache Scryfall: {e}")
-            try:
-                os.remove(tmp_file)
-            except OSError:
-                pass
+            if _SCRYFALL_CACHE_MEMORY is None:
+                return
+            snapshot = _SCRYFALL_CACHE_MEMORY.copy()
+        _write_snapshot_to_disk_locked(snapshot)
 
 def save_scryfall_cache(cache):
     global _SCRYFALL_CACHE_MEMORY
-    with _scryfall_lock:
-        _SCRYFALL_CACHE_MEMORY = cache.copy()
-    _write_scryfall_cache_to_disk()
+    with _scryfall_file_lock:
+        with _scryfall_lock:
+            _SCRYFALL_CACHE_MEMORY = cache.copy()
+            snapshot = _SCRYFALL_CACHE_MEMORY.copy()
+        _write_snapshot_to_disk_locked(snapshot)
 
 def _commit_scryfall_cache_updates(new_entries: dict, delete_keys: Optional[List[str]] = None) -> dict:
     global _SCRYFALL_CACHE_MEMORY
-    with _scryfall_lock:
-        if _SCRYFALL_CACHE_MEMORY is None:
-            _SCRYFALL_CACHE_MEMORY = {}
-        updated = _SCRYFALL_CACHE_MEMORY.copy()
-        if delete_keys:
-            for k in delete_keys:
-                updated.pop(k, None)
-        if new_entries:
-            updated.update(new_entries)
-        _SCRYFALL_CACHE_MEMORY = updated
-        snapshot = updated.copy()
-    _write_scryfall_cache_to_disk()
+    with _scryfall_file_lock:
+        with _scryfall_lock:
+            if _SCRYFALL_CACHE_MEMORY is None:
+                _SCRYFALL_CACHE_MEMORY = _load_scryfall_cache_from_disk()
+            updated = _SCRYFALL_CACHE_MEMORY.copy()
+            if delete_keys:
+                for k in delete_keys:
+                    updated.pop(k, None)
+            if new_entries:
+                updated.update(new_entries)
+            _SCRYFALL_CACHE_MEMORY = updated
+            snapshot = updated.copy()
+        _write_snapshot_to_disk_locked(snapshot)
     return snapshot
 
 def _parse_scryfall_card_object(card: dict) -> dict:

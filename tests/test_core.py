@@ -267,6 +267,14 @@ class TestClientIpResolution(unittest.TestCase):
         )
         self.assertEqual(main.get_client_ip(req_xff), "203.0.113.7")
 
+    def test_trust_cf_headers_disabled_falls_back_to_xff(self):
+        req_cf = self._make_request(
+            "127.0.0.1",
+            {"CF-Connecting-IP": "198.51.100.99", "X-Forwarded-For": "203.0.113.77"},
+        )
+        with patch.dict(os.environ, {"TRUST_CF_HEADERS": "0"}, clear=False):
+            self.assertEqual(main.get_client_ip(req_cf), "203.0.113.77")
+
 
 class TestScryfallCacheThreadSafety(unittest.TestCase):
     def test_snapshot_isolation_and_atomic_commit(self):
@@ -1267,6 +1275,42 @@ class TestEndpointBehaviorAndCardDetails(unittest.TestCase):
                 with self.assertRaises(HTTPException) as rl_ctx:
                     asyncio.run(main.remove_deck(req, "abc123", x_admin_secret="super-secret-token"))
                 self.assertEqual(rl_ctx.exception.status_code, 429)
+
+    def test_admin_rate_limit_cap_eviction_and_secret_strip(self):
+        import asyncio
+        from fastapi import HTTPException
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            main_db = os.path.join(tmpdir, "centurion.db")
+            conn = sqlite3.connect(main_db)
+            conn.execute("CREATE TABLE decks (id_moxfield TEXT PRIMARY KEY, comandante TEXT, data_aggiornamento TEXT)")
+            conn.execute("CREATE TABLE deck_cards (deck_id TEXT, card_name TEXT)")
+            conn.execute("CREATE TABLE blacklist (id_moxfield TEXT PRIMARY KEY, data_rimozione TEXT)")
+            conn.commit()
+            conn.close()
+
+            def _get_test_db():
+                c = sqlite3.connect(main_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            with (
+                patch.object(main, "get_db", side_effect=_get_test_db),
+                patch.object(main, "_ADMIN_FAILURES_MAX_ENTRIES", 3),
+                patch.dict(os.environ, {"ADMIN_SECRET": "  super-secret-token \n"}, clear=False),
+            ):
+                # Verifica .strip() su ADMIN_SECRET
+                req_ok = self._make_asgi_request("198.51.100.1")
+                res = asyncio.run(main.remove_deck(req_ok, "deck1", x_admin_secret="super-secret-token"))
+                self.assertEqual(res["status"], "success")
+
+                # Verifica cap/eviction a 3 chiavi su _ADMIN_FAILURES
+                for idx in range(5):
+                    req_bad = self._make_asgi_request(f"198.51.100.{10 + idx}")
+                    with self.assertRaises(HTTPException) as ctx:
+                        asyncio.run(main.remove_deck(req_bad, "deck1", x_admin_secret="wrong"))
+                    self.assertEqual(ctx.exception.status_code, 403)
+                    self.assertLessEqual(len(main._ADMIN_FAILURES), 3)
 
 
 if __name__ == "__main__":

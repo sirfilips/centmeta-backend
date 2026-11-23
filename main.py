@@ -2701,10 +2701,11 @@ def get_client_ip(request: Request) -> str:
     if not _is_trusted_proxy(peer_ip):
         return peer_ip or "127.0.0.1"
 
-    # 1. CF-Connecting-IP: sovrascritto in modo sicuro dall'edge di Cloudflare
-    cf_ip = _clean_ip(request.headers.get("cf-connecting-ip"))
-    if cf_ip:
-        return cf_ip
+    # 1. CF-Connecting-IP: sovrascritto in modo sicuro dall'edge di Cloudflare (abilitato di default per cloudflared; disattivabile con TRUST_CF_HEADERS=0)
+    if os.getenv("TRUST_CF_HEADERS", "1").strip() != "0":
+        cf_ip = _clean_ip(request.headers.get("cf-connecting-ip"))
+        if cf_ip:
+            return cf_ip
 
     # 2. X-Real-IP: impostato da reverse proxy locali (es. Nginx)
     x_real_ip = _clean_ip(request.headers.get("x-real-ip"))
@@ -2727,39 +2728,49 @@ def get_client_ip(request: Request) -> str:
     # 4. Connessione TCP diretta dal proxy
     return peer_ip or "127.0.0.1"
 
-def _hash_admin_rl_ip(request: Request) -> str:
-    ip = get_client_ip(request)
-    day_salt = datetime.now().strftime("%Y-%m-%d")
-    return hashlib.sha256(f"admin_rl:{day_salt}:{ip}".encode("utf-8")).hexdigest()
-
+_ADMIN_RL_SALT = secrets.token_hex(16)
+_ADMIN_FAILURES_MAX_ENTRIES = 1024
 _ADMIN_FAILURES: dict[str, list[float]] = {}
 _ADMIN_LOCK = threading.Lock()
+
+
+def _hash_admin_rl_ip(request: Request) -> str:
+    ip = get_client_ip(request)
+    return hashlib.sha256(f"admin_rl:{_ADMIN_RL_SALT}:{ip}".encode("utf-8")).hexdigest()
+
+
+def _prune_admin_failures_locked(now_ts: float):
+    cutoff = now_ts - 3600.0
+    for k in list(_ADMIN_FAILURES.keys()):
+        _ADMIN_FAILURES[k] = [t for t in _ADMIN_FAILURES[k] if t > cutoff]
+        if not _ADMIN_FAILURES[k]:
+            del _ADMIN_FAILURES[k]
+    while len(_ADMIN_FAILURES) > _ADMIN_FAILURES_MAX_ENTRIES:
+        oldest_key = next(iter(_ADMIN_FAILURES))
+        del _ADMIN_FAILURES[oldest_key]
+
 
 def _check_admin_rate_limit(request: Request):
     ip_key = _hash_admin_rl_ip(request)
     now_ts = std_time.time()
-    cutoff = now_ts - 3600.0
     with _ADMIN_LOCK:
-        for k in list(_ADMIN_FAILURES.keys()):
-            _ADMIN_FAILURES[k] = [t for t in _ADMIN_FAILURES[k] if t > cutoff]
-            if not _ADMIN_FAILURES[k]:
-                del _ADMIN_FAILURES[k]
+        _prune_admin_failures_locked(now_ts)
         recent_failures = _ADMIN_FAILURES.get(ip_key, [])
         if len(recent_failures) >= 10:
             raise HTTPException(status_code=429, detail="Troppi tentativi admin falliti da questo indirizzo IP. Riprova più tardi.")
 
+
 def _record_admin_failure(request: Request):
     ip_key = _hash_admin_rl_ip(request)
     now_ts = std_time.time()
-    cutoff = now_ts - 3600.0
     with _ADMIN_LOCK:
-        for k in list(_ADMIN_FAILURES.keys()):
-            _ADMIN_FAILURES[k] = [t for t in _ADMIN_FAILURES[k] if t > cutoff]
-            if not _ADMIN_FAILURES[k]:
-                del _ADMIN_FAILURES[k]
-        failures = _ADMIN_FAILURES.get(ip_key, [])
+        _prune_admin_failures_locked(now_ts)
+        failures = _ADMIN_FAILURES.pop(ip_key, [])
         failures.append(now_ts)
         _ADMIN_FAILURES[ip_key] = failures
+        while len(_ADMIN_FAILURES) > _ADMIN_FAILURES_MAX_ENTRIES:
+            oldest_key = next(iter(_ADMIN_FAILURES))
+            del _ADMIN_FAILURES[oldest_key]
 
 _DECK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -2782,15 +2793,15 @@ async def remove_deck(
     deck_id: str, 
     x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")
 ):
-    _check_admin_rate_limit(request)
-    admin_password = os.getenv("ADMIN_SECRET")
+    await run_in_threadpool(_check_admin_rate_limit, request)
+    admin_password = (os.getenv("ADMIN_SECRET") or "").strip()
     
     if not admin_password or not x_admin_secret:
-        _record_admin_failure(request)
+        await run_in_threadpool(_record_admin_failure, request)
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
         
     if not secrets.compare_digest(x_admin_secret.encode('utf-8'), admin_password.encode('utf-8')):
-        _record_admin_failure(request)
+        await run_in_threadpool(_record_admin_failure, request)
         raise HTTPException(status_code=403, detail="Accesso negato: credenziali non valide")
 
     if not _DECK_ID_RE.fullmatch(deck_id):

@@ -151,6 +151,7 @@ def ensure_covering_indices(cursor):
     """Crea e verifica gli indici covering ottimizzati su decks e deck_cards. Restituisce True se sono stati ricreati."""
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_comandante ON decks(comandante)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_data ON decks(data_aggiornamento)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_decks_cmd_data ON decks(comandante, data_aggiornamento DESC)")
 
     existing_idx = {
         row[0]: (row[1] or "")

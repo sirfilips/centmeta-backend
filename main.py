@@ -16,6 +16,7 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.concurrency import run_in_threadpool
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -47,7 +48,7 @@ def get_db():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA cache_size = -64000")
+    conn.execute("PRAGMA cache_size = -16000")
     conn.execute("PRAGMA temp_store = MEMORY")
     return conn
 
@@ -531,6 +532,7 @@ app.add_middleware(
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["Accept", "Content-Type"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 def get_time_conditions_both(filtro_tempo: str):
     if filtro_tempo == "Ultimi 7 giorni":
@@ -2211,24 +2213,35 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
         q_cmd = f"SELECT d.comandante, COUNT(DISTINCT d.id_moxfield) as mazzi_carta FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond} GROUP BY d.comandante"
         cmd_counts = c.execute(q_cmd, [card_name] + inv_params).fetchall()
 
-        if inv_cond_plain:
-            q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d{inv_cond_plain}{time_filtered_cond} GROUP BY comandante"
+        matched_cmds = [r['comandante'] for r in cmd_counts]
+        if matched_cmds and len(matched_cmds) <= 500:
+            cmd_placeholders = '(' + ','.join(['?'] * len(matched_cmds)) + ')'
+            q_tot_cmd = f"SELECT comandante, COUNT(*) as totale_comandante FROM decks d WHERE comandante IN {cmd_placeholders}{time_filtered_cond} GROUP BY comandante"
+            total_counts = c.execute(q_tot_cmd, matched_cmds).fetchall()
+        elif inv_cond_plain:
+            q_tot_cmd = f"SELECT comandante, COUNT(*) as totale_comandante FROM decks d{inv_cond_plain}{time_filtered_cond} GROUP BY comandante"
+            total_counts = c.execute(q_tot_cmd, inv_params).fetchall()
         else:
             where_time_only = f" WHERE {t_cond.replace('data_aggiornamento', 'd.data_aggiornamento')}" if t_cond else ""
-            q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d{where_time_only} GROUP BY comandante"
-        total_counts = c.execute(q_tot_cmd, inv_params).fetchall()
+            q_tot_cmd = f"SELECT comandante, COUNT(*) as totale_comandante FROM decks d{where_time_only} GROUP BY comandante"
+            total_counts = c.execute(q_tot_cmd).fetchall()
 
         syn_query = f"""
-            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
-            FROM deck_cards c
-            JOIN decks d ON c.deck_id = d.id_moxfield
-            WHERE d.id_moxfield IN (
-                SELECT deck_id FROM deck_cards WHERE card_name = ?
+            WITH matching_decks AS (
+                SELECT DISTINCT d.id_moxfield
+                FROM deck_cards dc
+                JOIN decks d ON dc.deck_id = d.id_moxfield
+                WHERE dc.card_name = ?
+                {inv_cond_d}
+                {time_filtered_cond}
             )
-            {inv_cond_d}
-            {time_filtered_cond}
-            AND c.card_name != ?
+            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq
+            FROM matching_decks md
+            JOIN deck_cards c ON c.deck_id = md.id_moxfield
+            WHERE c.card_name != ?
             GROUP BY c.card_name
+            ORDER BY freq DESC, c.card_name ASC
+            LIMIT 50
         """
         syn_params = [card_name] + inv_params + [card_name]
         syn_rows = c.execute(syn_query, syn_params).fetchall()

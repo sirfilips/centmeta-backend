@@ -1396,6 +1396,79 @@ class TestEndpointBehaviorAndCardDetails(unittest.TestCase):
             self.assertTrue(scry_rows[-1][0].endswith("Z"))
             self.assertTrue(mox_rows[-1][0].endswith("Z"))
 
+    def test_gzip_middleware_and_composite_index_and_card_details_cte(self):
+        from starlette.middleware.gzip import GZipMiddleware
+
+        self.assertTrue(
+            any(m.cls is GZipMiddleware for m in main.app.user_middleware),
+            "GZipMiddleware deve essere registrato su main.app",
+        )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            main_db = os.path.join(tmpdir, "centurion.db")
+            master_scraper.init_db(main_db)
+
+            conn = sqlite3.connect(main_db)
+            conn.row_factory = sqlite3.Row
+            idx_names = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='decks'"
+                ).fetchall()
+            }
+            self.assertIn("idx_decks_cmd_data", idx_names)
+
+            # Popola 2 comandanti e 60 carte in co-occorrenza con Lightning Bolt per verificare ORDER BY + LIMIT 50 della CTE
+            for d_idx in range(3):
+                did = f"d{d_idx}"
+                cmd = "Kraum" if d_idx < 2 else "Atraxa"
+                conn.execute("INSERT INTO decks VALUES (?, ?, '2026-11-20T12:00:00Z')", (did, cmd))
+                conn.execute("INSERT INTO deck_cards VALUES (?, 'Lightning Bolt')", (did,))
+                for c_idx in range(55):
+                    if c_idx == 0 or d_idx == 0:
+                        conn.execute("INSERT INTO deck_cards VALUES (?, ?)", (did, f"Card_{c_idx:02d}"))
+            conn.commit()
+            conn.close()
+
+            def _get_test_db():
+                c = sqlite3.connect(main_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            fake_cache = {
+                "lightning bolt": {"full_name": "Lightning Bolt", "type": "Instant", "images": ["https://img/lb.jpg"], "art_crops": ["https://img/lb_a.jpg"], "oracles": ["3 dmg"], "color_identity": ["R"]},
+                "kraum": {"full_name": "Kraum", "type": "Legendary Creature", "images": ["https://img/k.jpg"], "art_crops": ["https://img/k_a.jpg"], "oracles": [""], "color_identity": ["U", "R"]},
+                "atraxa": {"full_name": "Atraxa", "type": "Legendary Creature", "images": ["https://img/a.jpg"], "art_crops": ["https://img/a_a.jpg"], "oracles": [""], "color_identity": ["W", "U", "B", "G"]},
+            }
+            for c_idx in range(55):
+                fake_cache[f"card_{c_idx:02d}"] = {
+                    "full_name": f"Card_{c_idx:02d}",
+                    "type": "Artifact",
+                    "images": [f"https://img/{c_idx}.jpg"],
+                    "art_crops": [],
+                    "oracles": [""],
+                    "color_identity": [],
+                }
+
+            main.get_card_details_cached.cache_clear()
+            try:
+                with (
+                    patch.object(main, "get_db", side_effect=_get_test_db),
+                    patch.object(main, "load_scryfall_cache", return_value=fake_cache),
+                    patch.object(main, "fetch_scryfall_data", return_value=fake_cache),
+                    patch.object(main, "get_global_commanders_validity", return_value=(frozenset({"Kraum", "Atraxa"}), ())),
+                    patch.object(main, "get_global_cards_stats", return_value=(3, {"Lightning Bolt": 3})),
+                ):
+                    details = main.get_card_details_cached("Lightning Bolt", "Tutti i tempi")
+            finally:
+                main.get_card_details_cached.cache_clear()
+
+            self.assertEqual(len(details["synergies"]), 50)
+            self.assertEqual(details["synergies"][0]["card_name"], "Card_00")
+            self.assertEqual(details["synergies"][0]["freq"], 3)
+            self.assertEqual(len(details["commanders"]), 2)
+            self.assertEqual(details["commanders"][0]["totale_comandante"], 2 if details["commanders"][0]["comandante"] == "Kraum" else 1)
+
 
 if __name__ == "__main__":
     unittest.main()

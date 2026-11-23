@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import threading
 import requests
 from datetime import datetime
@@ -26,15 +27,32 @@ json_path = os.path.join(cartella_script, "database_centurion.json")
 log_path = os.path.join(cartella_script, "scraper.log")
 lock_path = os.path.join(cartella_script, "scraper.lock")
 
-# Configurazione del Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(log_path, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+# Configurazione del Logging (su domanda in run_scraper/__main__, non a import-time)
+_LOGGING_CONFIGURED = False
+
+
+def configure_scraper_logging() -> None:
+    """Configura RotatingFileHandler e console una sola volta per lo scraper CLI."""
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    if not any(isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root_logger.handlers):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        root_logger.addHandler(stream_handler)
+    _LOGGING_CONFIGURED = True
 
 class ScraperProcessLock:
     """
@@ -265,6 +283,7 @@ def _chunks(lst, n):
         yield lst[i:i + n]
 
 def run_scraper() -> bool:
+    configure_scraper_logging()
     with ScraperProcessLock(lock_path) as acquired:
         if not acquired:
             logging.warning("[LOCK] Un'altra istanza dello scraper è già in esecuzione. Operazione ignorata.")
@@ -625,4 +644,5 @@ def _run_scraper_locked() -> bool:
         conn.close()
 
 if __name__ == "__main__":
+    configure_scraper_logging()
     run_scraper()

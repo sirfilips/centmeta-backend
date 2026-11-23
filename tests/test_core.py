@@ -862,5 +862,193 @@ class TestRoleClassificationAndScryfallSearch(unittest.TestCase):
             main.get_commander_decks_cached.cache_clear()
 
 
+class TestEndpointBehaviorAndCardDetails(unittest.TestCase):
+    def setUp(self):
+        with main._ADMIN_LOCK:
+            main._ADMIN_FAILURES.clear()
+
+    def tearDown(self):
+        with main._ADMIN_LOCK:
+            main._ADMIN_FAILURES.clear()
+
+    @staticmethod
+    def _make_asgi_request(peer_host: str = "198.51.100.10", headers: dict | None = None):
+        from starlette.requests import Request
+
+        raw_headers = [
+            (k.lower().encode("latin-1"), v.encode("latin-1"))
+            for k, v in (headers or {}).items()
+        ]
+        scope = {
+            "type": "http",
+            "method": "DELETE",
+            "path": "/api/admin/remove-deck/test1",
+            "headers": raw_headers,
+            "client": (peer_host, 12345),
+        }
+        return Request(scope)
+
+    def test_health_endpoint_returns_history(self):
+        import asyncio
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            health_db = os.path.join(tmpdir, "health.db")
+            conn = sqlite3.connect(health_db)
+            conn.execute("CREATE TABLE health_logs (service TEXT, status TEXT, timestamp TEXT)")
+            conn.executemany(
+                "INSERT INTO health_logs VALUES (?, ?, ?)",
+                [
+                    ("moxfield", "UP", "2026-11-23T09:00:00"),
+                    ("scryfall", "DOWN", "2026-11-23T09:05:00"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            def _get_test_health_db():
+                c = sqlite3.connect(health_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            with (
+                patch.object(main, "get_health_db", side_effect=_get_test_health_db),
+                patch.object(main, "get_db_mtime", return_value=1700000000.0),
+            ):
+                res = asyncio.run(main.get_health_status())
+
+            self.assertIsNotNone(res["db_last_updated"])
+            self.assertEqual(len(res["history"]["moxfield"]), 1)
+            self.assertEqual(res["history"]["moxfield"][0]["status"], "UP")
+            self.assertEqual(res["history"]["scryfall"][0]["status"], "DOWN")
+
+    def test_card_details_slices_top_15_before_scryfall_fetch(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            main_db = os.path.join(tmpdir, "centurion.db")
+            conn = sqlite3.connect(main_db)
+            conn.execute("CREATE TABLE decks (id_moxfield TEXT PRIMARY KEY, comandante TEXT, data_aggiornamento TEXT)")
+            conn.execute("CREATE TABLE deck_cards (deck_id TEXT, card_name TEXT)")
+            valid_cmds = []
+            for i in range(20):
+                cmd_name = f"Commander_{i:02d}"
+                valid_cmds.append(cmd_name)
+                deck_id = f"d{i:02d}"
+                conn.execute("INSERT INTO decks VALUES (?, ?, '2026-11-20T12:00:00')", (deck_id, cmd_name))
+                conn.execute("INSERT INTO deck_cards VALUES (?, 'Lightning Bolt')", (deck_id,))
+                conn.execute("INSERT INTO deck_cards VALUES (?, 'Sol Ring')", (deck_id,))
+            conn.commit()
+            conn.close()
+
+            def _get_test_db():
+                c = sqlite3.connect(main_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            fetch_calls = []
+            fake_cache = {
+                "lightning bolt": {
+                    "full_name": "Lightning Bolt",
+                    "type": "Instant",
+                    "images": ["https://img/lb.jpg"],
+                    "art_crops": ["https://img/lb_art.jpg"],
+                    "artist": "Christopher Moeller",
+                    "oracles": ["Lightning Bolt deals 3 damage to any target."],
+                    "color_identity": ["R"],
+                },
+                "sol ring": {
+                    "full_name": "Sol Ring",
+                    "type": "Artifact",
+                    "images": ["https://img/sr.jpg"],
+                    "art_crops": [],
+                    "artist": "Mike Bierek",
+                    "oracles": ["{T}: Add {C}{C}."],
+                    "color_identity": [],
+                },
+            }
+            for cmd in valid_cmds:
+                fake_cache[cmd.lower()] = {
+                    "full_name": cmd,
+                    "type": "Legendary Creature",
+                    "images": [f"https://img/{cmd}.jpg"],
+                    "art_crops": [f"https://img/{cmd}_art.jpg"],
+                    "artist": "Artist",
+                    "oracles": [""],
+                    "color_identity": ["R"],
+                }
+
+            def _spy_fetch(names):
+                fetch_calls.append(list(names))
+                return fake_cache
+
+            main.get_card_details_cached.cache_clear()
+            try:
+                with (
+                    patch.object(main, "get_db", side_effect=_get_test_db),
+                    patch.object(main, "load_scryfall_cache", return_value=fake_cache),
+                    patch.object(main, "fetch_scryfall_data", side_effect=_spy_fetch),
+                    patch.object(main, "get_global_commanders_validity", return_value=(frozenset(valid_cmds), ())),
+                    patch.object(main, "get_global_cards_stats", return_value=(20, {"Lightning Bolt": 20, "Sol Ring": 20})),
+                ):
+                    details = main.get_card_details_cached("Lightning Bolt", "Tutti i tempi")
+            finally:
+                main.get_card_details_cached.cache_clear()
+
+            self.assertEqual(len(details["commanders"]), 15)
+            # La prima fetch per i comandanti deve ricevere solo i top 15 comandanti (+ Lightning Bolt), mai tutti i 20
+            cmd_fetch_batch = fetch_calls[0]
+            self.assertEqual(len(cmd_fetch_batch), 16)
+            self.assertEqual(details["synergies"][0]["card_name"], "Sol Ring")
+
+    def test_admin_remove_deck_auth_validation_and_rate_limit(self):
+        import asyncio
+        from fastapi import HTTPException
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            main_db = os.path.join(tmpdir, "centurion.db")
+            conn = sqlite3.connect(main_db)
+            conn.execute("CREATE TABLE decks (id_moxfield TEXT PRIMARY KEY, comandante TEXT, data_aggiornamento TEXT)")
+            conn.execute("CREATE TABLE deck_cards (deck_id TEXT, card_name TEXT)")
+            conn.execute("CREATE TABLE blacklist (id_moxfield TEXT PRIMARY KEY, data_rimozione TEXT)")
+            conn.execute("INSERT INTO decks VALUES ('abc123', 'Kraum', '2026-11-20')")
+            conn.execute("INSERT INTO deck_cards VALUES ('abc123', 'Lightning Bolt')")
+            conn.commit()
+            conn.close()
+
+            def _get_test_db():
+                c = sqlite3.connect(main_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            req = self._make_asgi_request("198.51.100.77")
+
+            with (
+                patch.object(main, "get_db", side_effect=_get_test_db),
+                patch.dict(os.environ, {"ADMIN_SECRET": "super-secret-token"}, clear=False),
+            ):
+                # 1. ID non valido con secret valido -> 400
+                with self.assertRaises(HTTPException) as bad_id_ctx:
+                    asyncio.run(main.remove_deck(req, "../bad", x_admin_secret="super-secret-token"))
+                self.assertEqual(bad_id_ctx.exception.status_code, 400)
+
+                # 2. Operazione valida -> 200 e rimozione dal DB + blacklist
+                ok_res = asyncio.run(main.remove_deck(req, "abc123", x_admin_secret="super-secret-token"))
+                self.assertEqual(ok_res["status"], "success")
+
+                check_conn = sqlite3.connect(main_db)
+                self.assertEqual(check_conn.execute("SELECT COUNT(*) FROM decks").fetchone()[0], 0)
+                self.assertEqual(check_conn.execute("SELECT COUNT(*) FROM deck_cards").fetchone()[0], 0)
+                self.assertEqual(check_conn.execute("SELECT id_moxfield FROM blacklist").fetchone()[0], "abc123")
+                check_conn.close()
+
+                # 3. 10 tentativi errati -> 403, poi l'11esimo -> 429 rate limit
+                for _ in range(10):
+                    with self.assertRaises(HTTPException) as unauth_ctx:
+                        asyncio.run(main.remove_deck(req, "abc123", x_admin_secret="wrong"))
+                    self.assertEqual(unauth_ctx.exception.status_code, 403)
+
+                with self.assertRaises(HTTPException) as rl_ctx:
+                    asyncio.run(main.remove_deck(req, "abc123", x_admin_secret="super-secret-token"))
+                self.assertEqual(rl_ctx.exception.status_code, 429)
+
+
 if __name__ == "__main__":
     unittest.main()

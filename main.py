@@ -13,7 +13,7 @@ import logging
 import secrets
 import hashlib
 from datetime import datetime, time, timedelta
-from fastapi import FastAPI, HTTPException, Header, Query, Request
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from typing import Optional, List, Dict, Any
@@ -45,12 +45,17 @@ def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA cache_size = -64000")
+    conn.execute("PRAGMA temp_store = MEMORY")
     return conn
 
 def get_health_db():
     conn = sqlite3.connect(HEALTH_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
     return conn
 
 def sanitize_commanders_in_db():
@@ -1211,9 +1216,11 @@ def get_global_commanders_validity():
     dei comandanti non validi presenti nel DB (es. 'Sconosciuto' o carte non leggendarie).
     """
     conn = get_db()
-    c = conn.cursor()
-    rows = c.execute("SELECT DISTINCT comandante FROM decks").fetchall()
-    conn.close()
+    try:
+        c = conn.cursor()
+        rows = c.execute("SELECT DISTINCT comandante FROM decks").fetchall()
+    finally:
+        conn.close()
 
     all_cmds = [r["comandante"] for r in rows if r["comandante"]]
     scryfall_cache = fetch_scryfall_data(all_cmds)
@@ -1237,29 +1244,30 @@ def get_global_cards_stats():
     """
     _, invalid_cmds = get_global_commanders_validity()
     conn = get_db()
-    c = conn.cursor()
+    try:
+        c = conn.cursor()
 
-    if invalid_cmds:
-        placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
-        global_total = c.execute(
-            f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks WHERE comandante NOT IN {placeholders}",
-            invalid_cmds
-        ).fetchone()["tot"]
-        gc_rows = c.execute(
-            f"""
-            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as g_freq
-            FROM deck_cards c
-            JOIN decks d ON c.deck_id = d.id_moxfield
-            WHERE d.comandante NOT IN {placeholders}
-            GROUP BY c.card_name
-            """,
-            invalid_cmds
-        ).fetchall()
-    else:
-        global_total = c.execute("SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks").fetchone()["tot"]
-        gc_rows = c.execute("SELECT card_name, COUNT(DISTINCT deck_id) as g_freq FROM deck_cards GROUP BY card_name").fetchall()
-
-    conn.close()
+        if invalid_cmds:
+            placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+            global_total = c.execute(
+                f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks WHERE comandante NOT IN {placeholders}",
+                invalid_cmds
+            ).fetchone()["tot"]
+            gc_rows = c.execute(
+                f"""
+                SELECT c.card_name, COUNT(DISTINCT c.deck_id) as g_freq
+                FROM deck_cards c
+                JOIN decks d ON c.deck_id = d.id_moxfield
+                WHERE d.comandante NOT IN {placeholders}
+                GROUP BY c.card_name
+                """,
+                invalid_cmds
+            ).fetchall()
+        else:
+            global_total = c.execute("SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks").fetchone()["tot"]
+            gc_rows = c.execute("SELECT card_name, COUNT(DISTINCT deck_id) as g_freq FROM deck_cards GROUP BY card_name").fetchall()
+    finally:
+        conn.close()
     global_cards = {r["card_name"]: r["g_freq"] for r in gc_rows}
     return global_total, global_cards
 
@@ -1268,45 +1276,46 @@ def get_global_cards_stats():
 def get_valid_commanders_set(filtro_tempo: str):
     _, invalid_cmds = get_global_commanders_validity()
     conn = get_db()
-    c = conn.cursor()
-    curr_cond, prev_cond = get_time_conditions_both(filtro_tempo)
+    try:
+        c = conn.cursor()
+        curr_cond, prev_cond = get_time_conditions_both(filtro_tempo)
 
-    curr_conds = []
-    curr_params = []
-    if curr_cond:
-        curr_conds.append(curr_cond)
-    if invalid_cmds:
-        placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
-        curr_conds.append(f"comandante NOT IN {placeholders}")
-        curr_params.extend(invalid_cmds)
-
-    base_where = f"WHERE {' AND '.join(curr_conds)}" if curr_conds else ""
-    q_curr = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
-    curr_rows = c.execute(q_curr, curr_params).fetchall()
-    
-    if prev_cond:
-        prev_conds = [prev_cond]
-        prev_params = []
+        curr_conds = []
+        curr_params = []
+        if curr_cond:
+            curr_conds.append(curr_cond)
         if invalid_cmds:
             placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
-            prev_conds.append(f"comandante NOT IN {placeholders}")
-            prev_params.extend(invalid_cmds)
-        q_prev = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {' AND '.join(prev_conds)} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
-        prev_rows = c.execute(q_prev, prev_params).fetchall()
-        prev_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_rows)}
-        
-        df_curr = []
-        for idx, r in enumerate(curr_rows):
-            cmd = r['comandante']
-            if cmd in prev_ranks:
-                trend = prev_ranks[cmd] - (idx + 1)
-            else:
-                trend = None
-            df_curr.append({'comandante': cmd, 'cnt': r['cnt'], 'trend': trend})
-    else:
-        df_curr = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_rows]
+            curr_conds.append(f"comandante NOT IN {placeholders}")
+            curr_params.extend(invalid_cmds)
 
-    conn.close()
+        base_where = f"WHERE {' AND '.join(curr_conds)}" if curr_conds else ""
+        q_curr = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
+        curr_rows = c.execute(q_curr, curr_params).fetchall()
+        
+        if prev_cond:
+            prev_conds = [prev_cond]
+            prev_params = []
+            if invalid_cmds:
+                placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+                prev_conds.append(f"comandante NOT IN {placeholders}")
+                prev_params.extend(invalid_cmds)
+            q_prev = f"SELECT comandante, COUNT(*) as cnt FROM decks WHERE {' AND '.join(prev_conds)} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
+            prev_rows = c.execute(q_prev, prev_params).fetchall()
+            prev_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_rows)}
+            
+            df_curr = []
+            for idx, r in enumerate(curr_rows):
+                cmd = r['comandante']
+                if cmd in prev_ranks:
+                    trend = prev_ranks[cmd] - (idx + 1)
+                else:
+                    trend = None
+                df_curr.append({'comandante': cmd, 'cnt': r['cnt'], 'trend': trend})
+        else:
+            df_curr = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_rows]
+    finally:
+        conn.close()
     
     if not df_curr:
         return frozenset(), []
@@ -1527,121 +1536,122 @@ def get_recent_expansions_metadata() -> List[dict]:
 def get_dashboard_data_cached(filtro_tempo: str):
     _, invalid_cmds = get_global_commanders_validity()
     conn = get_db()
-    c = conn.cursor()
-    curr_cond, prev_cond = get_time_conditions_both(filtro_tempo)
+    try:
+        c = conn.cursor()
+        curr_cond, prev_cond = get_time_conditions_both(filtro_tempo)
 
-    inv_clause = ""
-    inv_clause_d = ""
-    inv_params = list(invalid_cmds)
-    if invalid_cmds:
-        placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
-        inv_clause = f"comandante NOT IN {placeholders}"
-        inv_clause_d = f"d.comandante NOT IN {placeholders}"
-
-    def build_where(time_c: Optional[str], use_alias: bool = False):
-        conds = []
-        if time_c:
-            conds.append(time_c.replace("data_aggiornamento", "d.data_aggiornamento") if use_alias else time_c)
+        inv_clause = ""
+        inv_clause_d = ""
+        inv_params = list(invalid_cmds)
         if invalid_cmds:
-            conds.append(inv_clause_d if use_alias else inv_clause)
-        return ("WHERE " + " AND ".join(conds)) if conds else ""
+            placeholders = "(" + ",".join(["?"] * len(invalid_cmds)) + ")"
+            inv_clause = f"comandante NOT IN {placeholders}"
+            inv_clause_d = f"d.comandante NOT IN {placeholders}"
 
-    base_where = build_where(curr_cond, False)
-    tot_decks = c.execute(f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {base_where}", inv_params).fetchone()['tot']
+        def build_where(time_c: Optional[str], use_alias: bool = False):
+            conds = []
+            if time_c:
+                conds.append(time_c.replace("data_aggiornamento", "d.data_aggiornamento") if use_alias else time_c)
+            if invalid_cmds:
+                conds.append(inv_clause_d if use_alias else inv_clause)
+            return ("WHERE " + " AND ".join(conds)) if conds else ""
 
-    q_curr_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
-    curr_cmd_rows = c.execute(q_curr_cmd, inv_params).fetchall()
-    
-    if prev_cond:
-        prev_where = build_where(prev_cond, False)
-        q_prev_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {prev_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
-        prev_cmd_rows = c.execute(q_prev_cmd, inv_params).fetchall()
-        prev_cmd_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_cmd_rows)}
+        base_where = build_where(curr_cond, False)
+        tot_decks = c.execute(f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {base_where}", inv_params).fetchone()['tot']
+
+        q_curr_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {base_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
+        curr_cmd_rows = c.execute(q_curr_cmd, inv_params).fetchall()
         
-        df_top_cmd = []
-        for idx, r in enumerate(curr_cmd_rows[:25]):
-            cmd = r['comandante']
-            trend = prev_cmd_ranks[cmd] - (idx + 1) if cmd in prev_cmd_ranks else None
-            df_top_cmd.append({'comandante': cmd, 'cnt': r['cnt'], 'trend': trend})
-    else:
-        df_top_cmd = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_cmd_rows[:25]]
-
-    p1_where = build_where("data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days')", False)
-    p2_where = build_where("data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days')", False)
-    p1_rows = c.execute(f"SELECT comandante, COUNT(*) as cnt1 FROM decks {p1_where} GROUP BY comandante", inv_params).fetchall()
-    p2_rows = c.execute(f"SELECT comandante, COUNT(*) as cnt2 FROM decks {p2_where} GROUP BY comandante", inv_params).fetchall()
-    p2_dict = {r['comandante']: r['cnt2'] for r in p2_rows}
-    
-    df_hot_cmd = []
-    for r in p1_rows:
-        cmd = r['comandante']
-        cnt1 = r['cnt1']
-        cnt2 = p2_dict.get(cmd, 0)
-        delta = cnt1 - cnt2
-        if cnt1 >= 2 and delta > 0:
-            df_hot_cmd.append({'comandante': cmd, 'cnt1': cnt1, 'delta': delta})
+        if prev_cond:
+            prev_where = build_where(prev_cond, False)
+            q_prev_cmd = f"SELECT comandante, COUNT(*) as cnt FROM decks {prev_where} GROUP BY comandante ORDER BY cnt DESC, comandante ASC"
+            prev_cmd_rows = c.execute(q_prev_cmd, inv_params).fetchall()
+            prev_cmd_ranks = {r['comandante']: idx + 1 for idx, r in enumerate(prev_cmd_rows)}
             
-    df_hot_cmd.sort(key=lambda x: (-x['delta'], -x['cnt1'], x['comandante']))
-    df_hot_cmd = df_hot_cmd[:50]
+            df_top_cmd = []
+            for idx, r in enumerate(curr_cmd_rows[:25]):
+                cmd = r['comandante']
+                trend = prev_cmd_ranks[cmd] - (idx + 1) if cmd in prev_cmd_ranks else None
+                df_top_cmd.append({'comandante': cmd, 'cnt': r['cnt'], 'trend': trend})
+        else:
+            df_top_cmd = [{'comandante': r['comandante'], 'cnt': r['cnt'], 'trend': ""} for r in curr_cmd_rows[:25]]
 
-    where_curr = build_where(curr_cond, True)
-    where_prev = build_where(prev_cond, True)
-    
-    q_curr_cards = f"""
-        SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
-        FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-        {where_curr}
-        GROUP BY c.card_name ORDER BY freq DESC, c.card_name ASC
-    """
-    curr_card_rows = c.execute(q_curr_cards, inv_params).fetchall()
-    
-    if prev_cond:
-        q_prev_cards = f"""
+        p1_where = build_where("data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days')", False)
+        p2_where = build_where("data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days')", False)
+        p1_rows = c.execute(f"SELECT comandante, COUNT(*) as cnt1 FROM decks {p1_where} GROUP BY comandante", inv_params).fetchall()
+        p2_rows = c.execute(f"SELECT comandante, COUNT(*) as cnt2 FROM decks {p2_where} GROUP BY comandante", inv_params).fetchall()
+        p2_dict = {r['comandante']: r['cnt2'] for r in p2_rows}
+        
+        df_hot_cmd = []
+        for r in p1_rows:
+            cmd = r['comandante']
+            cnt1 = r['cnt1']
+            cnt2 = p2_dict.get(cmd, 0)
+            delta = cnt1 - cnt2
+            if cnt1 >= 2 and delta > 0:
+                df_hot_cmd.append({'comandante': cmd, 'cnt1': cnt1, 'delta': delta})
+                
+        df_hot_cmd.sort(key=lambda x: (-x['delta'], -x['cnt1'], x['comandante']))
+        df_hot_cmd = df_hot_cmd[:50]
+
+        where_curr = build_where(curr_cond, True)
+        where_prev = build_where(prev_cond, True)
+        
+        q_curr_cards = f"""
             SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
             FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-            {where_prev}
+            {where_curr}
             GROUP BY c.card_name ORDER BY freq DESC, c.card_name ASC
         """
-        prev_card_rows = c.execute(q_prev_cards, inv_params).fetchall()
-        prev_card_ranks = {r['card_name']: idx + 1 for idx, r in enumerate(prev_card_rows)}
+        curr_card_rows = c.execute(q_curr_cards, inv_params).fetchall()
         
-        df_top_cards = []
-        for idx, r in enumerate(curr_card_rows[:250]):
-            c_name = r['card_name']
-            trend = prev_card_ranks[c_name] - (idx + 1) if c_name in prev_card_ranks else None
-            df_top_cards.append({'card_name': c_name, 'freq': r['freq'], 'trend': trend})
-    else:
-        df_top_cards = [{'card_name': r['card_name'], 'freq': r['freq'], 'trend': ""} for r in curr_card_rows[:250]]
-
-    hc1_where = build_where("data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days')", True)
-    hc2_where = build_where("data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days')", True)
-    q_hc1 = f"""
-        SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt1 
-        FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-        {hc1_where} GROUP BY c.card_name
-    """
-    q_hc2 = f"""
-        SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt2 
-        FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
-        {hc2_where} GROUP BY c.card_name
-    """
-    hc1_rows = c.execute(q_hc1, inv_params).fetchall()
-    hc2_rows = c.execute(q_hc2, inv_params).fetchall()
-    hc2_dict = {r['card_name']: r['cnt2'] for r in hc2_rows}
-    
-    df_hot_c = []
-    for r in hc1_rows:
-        c_name = r['card_name']
-        cnt1 = r['cnt1']
-        cnt2 = hc2_dict.get(c_name, 0)
-        delta = cnt1 - cnt2
-        if cnt1 >= 3 and delta > 0:
-            df_hot_c.append({'card_name': c_name, 'cnt1': cnt1, 'delta': delta})
+        if prev_cond:
+            q_prev_cards = f"""
+                SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
+                FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
+                {where_prev}
+                GROUP BY c.card_name ORDER BY freq DESC, c.card_name ASC
+            """
+            prev_card_rows = c.execute(q_prev_cards, inv_params).fetchall()
+            prev_card_ranks = {r['card_name']: idx + 1 for idx, r in enumerate(prev_card_rows)}
             
-    df_hot_c.sort(key=lambda x: (-x['delta'], -x['cnt1'], x['card_name']))
-    df_hot_c = df_hot_c[:250]
+            df_top_cards = []
+            for idx, r in enumerate(curr_card_rows[:250]):
+                c_name = r['card_name']
+                trend = prev_card_ranks[c_name] - (idx + 1) if c_name in prev_card_ranks else None
+                df_top_cards.append({'card_name': c_name, 'freq': r['freq'], 'trend': trend})
+        else:
+            df_top_cards = [{'card_name': r['card_name'], 'freq': r['freq'], 'trend': ""} for r in curr_card_rows[:250]]
+
+        hc1_where = build_where("data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days')", True)
+        hc2_where = build_where("data_aggiornamento <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-7 days') AND data_aggiornamento > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-14 days')", True)
+        q_hc1 = f"""
+            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt1 
+            FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
+            {hc1_where} GROUP BY c.card_name
+        """
+        q_hc2 = f"""
+            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as cnt2 
+            FROM deck_cards c JOIN decks d ON c.deck_id = d.id_moxfield 
+            {hc2_where} GROUP BY c.card_name
+        """
+        hc1_rows = c.execute(q_hc1, inv_params).fetchall()
+        hc2_rows = c.execute(q_hc2, inv_params).fetchall()
+        hc2_dict = {r['card_name']: r['cnt2'] for r in hc2_rows}
         
-    conn.close()
+        df_hot_c = []
+        for r in hc1_rows:
+            c_name = r['card_name']
+            cnt1 = r['cnt1']
+            cnt2 = hc2_dict.get(c_name, 0)
+            delta = cnt1 - cnt2
+            if cnt1 >= 3 and delta > 0:
+                df_hot_c.append({'card_name': c_name, 'cnt1': cnt1, 'delta': delta})
+                
+        df_hot_c.sort(key=lambda x: (-x['delta'], -x['cnt1'], x['card_name']))
+        df_hot_c = df_hot_c[:250]
+    finally:
+        conn.close()
 
     all_names = set()
     for r in df_top_cmd: all_names.add(r['comandante'])
@@ -1894,43 +1904,44 @@ def get_decks_stats_cached(filtro_tempo: str, comandante: Optional[str]):
         return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
 
     conn = get_db()
-    c = conn.cursor()
+    try:
+        c = conn.cursor()
 
-    conds = []
-    t_cond = get_time_condition(filtro_tempo)
-    if t_cond:
-        conds.append(t_cond)
-    
-    params = []
-    if comandante:
-        conds.append("comandante = ?")
-        params.append(comandante)
-    elif invalid_cmds:
-        placeholders_inv = '(' + ','.join(['?'] * len(invalid_cmds)) + ')'
-        conds.append(f"comandante NOT IN {placeholders_inv}")
-        params.extend(invalid_cmds)
+        conds = []
+        t_cond = get_time_condition(filtro_tempo)
+        if t_cond:
+            conds.append(t_cond)
         
-    where_clause = (" WHERE " + " AND ".join(conds)) if conds else ""
-    
-    q_total = f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {where_clause}"
-    total_decks = c.execute(q_total, params).fetchone()['tot']
-    
-    if total_decks == 0:
+        params = []
+        if comandante:
+            conds.append("comandante = ?")
+            params.append(comandante)
+        elif invalid_cmds:
+            placeholders_inv = '(' + ','.join(['?'] * len(invalid_cmds)) + ')'
+            conds.append(f"comandante NOT IN {placeholders_inv}")
+            params.extend(invalid_cmds)
+            
+        where_clause = (" WHERE " + " AND ".join(conds)) if conds else ""
+        
+        q_total = f"SELECT COUNT(DISTINCT id_moxfield) as tot FROM decks {where_clause}"
+        total_decks = c.execute(q_total, params).fetchone()['tot']
+        
+        if total_decks == 0:
+            return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
+            
+        where_clause_join = where_clause.replace("comandante", "d.comandante").replace("data_aggiornamento", "d.data_aggiornamento")
+        
+        q_cards = f"""
+            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq
+            FROM deck_cards c
+            JOIN decks d ON c.deck_id = d.id_moxfield
+            {where_clause_join}
+            GROUP BY c.card_name
+        """
+            
+        stats_rows = c.execute(q_cards, params).fetchall()
+    finally:
         conn.close()
-        return {"total_decks": 0, "last_updated": global_last_updated, "mana_curve": {}, "cards": []}
-        
-    where_clause_join = where_clause.replace("comandante", "d.comandante").replace("data_aggiornamento", "d.data_aggiornamento")
-    
-    q_cards = f"""
-        SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq
-        FROM deck_cards c
-        JOIN decks d ON c.deck_id = d.id_moxfield
-        {where_clause_join}
-        GROUP BY c.card_name
-    """
-        
-    stats_rows = c.execute(q_cards, params).fetchall()
-    conn.close()
     
     stats_list = []
     for row in stats_rows:
@@ -2053,8 +2064,6 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
         }
 
     conn = get_db()
-    c = conn.cursor()
-
     inv_cond_d = ""
     inv_cond_plain = ""
     inv_params = list(invalid_cmds)
@@ -2068,37 +2077,56 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
     if t_cond:
         time_filtered_cond = " AND " + t_cond.replace("data_aggiornamento", "d.data_aggiornamento")
 
-    if not t_cond:
-        total_decks_time = total_decks_global
-    else:
-        q_tot_time = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond}"
-        total_decks_time = c.execute(q_tot_time, [card_name] + inv_params).fetchone()['tot']
+    try:
+        c = conn.cursor()
+        if not t_cond:
+            total_decks_time = total_decks_global
+        else:
+            q_tot_time = f"SELECT COUNT(DISTINCT d.id_moxfield) as tot FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond}"
+            total_decks_time = c.execute(q_tot_time, [card_name] + inv_params).fetchone()['tot']
 
-    if total_decks_time == 0:
+        if total_decks_time == 0:
+            return {
+                "card_name": card_name,
+                "images": card_info_cache.get("images", []),
+                "art_crops": card_info_cache.get("art_crops", []),
+                "artist": card_info_cache.get("artist", ""),
+                "oracles": card_info_cache.get("oracles", []),
+                "total_decks_with_card": 0,
+                "total_decks_global": total_decks_global,
+                "commanders": [],
+                "synergies": []
+            }
+
+        q_cmd = f"SELECT d.comandante, COUNT(DISTINCT d.id_moxfield) as mazzi_carta FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond} GROUP BY d.comandante"
+        cmd_counts = c.execute(q_cmd, [card_name] + inv_params).fetchall()
+
+        if inv_cond_plain:
+            q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d{inv_cond_plain}{time_filtered_cond} GROUP BY comandante"
+        else:
+            where_time_only = f" WHERE {t_cond.replace('data_aggiornamento', 'd.data_aggiornamento')}" if t_cond else ""
+            q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d{where_time_only} GROUP BY comandante"
+        total_counts = c.execute(q_tot_cmd, inv_params).fetchall()
+
+        syn_query = f"""
+            SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
+            FROM deck_cards c
+            JOIN decks d ON c.deck_id = d.id_moxfield
+            WHERE d.id_moxfield IN (
+                SELECT deck_id FROM deck_cards WHERE card_name = ?
+            )
+            {inv_cond_d}
+            {time_filtered_cond}
+            AND c.card_name != ?
+            GROUP BY c.card_name
+        """
+        syn_params = [card_name] + inv_params + [card_name]
+        syn_rows = c.execute(syn_query, syn_params).fetchall()
+    finally:
         conn.close()
-        return {
-            "card_name": card_name,
-            "images": card_info_cache.get("images", []),
-            "art_crops": card_info_cache.get("art_crops", []),
-            "artist": card_info_cache.get("artist", ""),
-            "oracles": card_info_cache.get("oracles", []),
-            "total_decks_with_card": 0,
-            "total_decks_global": total_decks_global,
-            "commanders": [],
-            "synergies": []
-        }
-        
-    q_cmd = f"SELECT d.comandante, COUNT(DISTINCT d.id_moxfield) as mazzi_carta FROM decks d JOIN deck_cards c ON d.id_moxfield = c.deck_id WHERE c.card_name = ?{inv_cond_d}{time_filtered_cond} GROUP BY d.comandante"
-    cmd_counts = c.execute(q_cmd, [card_name] + inv_params).fetchall()
-    
-    if inv_cond_plain:
-        q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d{inv_cond_plain}{time_filtered_cond} GROUP BY comandante"
-    else:
-        where_time_only = f" WHERE {t_cond.replace('data_aggiornamento', 'd.data_aggiornamento')}" if t_cond else ""
-        q_tot_cmd = f"SELECT comandante, COUNT(DISTINCT id_moxfield) as totale_comandante FROM decks d{where_time_only} GROUP BY comandante"
-    total_counts = c.execute(q_tot_cmd, inv_params).fetchall()
+
     tot_map = {r['comandante']: r['totale_comandante'] for r in total_counts}
-    
+
     res_cmd = []
     for r in cmd_counts:
         cmd = r['comandante']
@@ -2112,12 +2140,13 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
             'Percentuale': perc
         })
     res_cmd.sort(key=lambda x: (-x['Percentuale'], -x['mazzi_carta'], x['comandante']))
-    
-    all_cmd_names = [x['comandante'] for x in res_cmd]
-    scryfall_cache = fetch_scryfall_data(all_cmd_names + [card_name])
+
+    top_res_cmd = res_cmd[:15]
+    top_cmd_names = [x['comandante'] for x in top_res_cmd]
+    scryfall_cache = fetch_scryfall_data(top_cmd_names + [card_name])
 
     cmd_list = []
-    for row in res_cmd:
+    for row in top_res_cmd:
         name = row['comandante']
         _, images, art_crops, _, _ = extract_commander_metadata(name, scryfall_cache)
 
@@ -2130,23 +2159,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
             "art_crops": art_crops,
             "artist": extract_commander_search_fields(name, scryfall_cache)["artist"]
         })
-        
-    syn_query = f"""
-        SELECT c.card_name, COUNT(DISTINCT c.deck_id) as freq 
-        FROM deck_cards c
-        JOIN decks d ON c.deck_id = d.id_moxfield
-        WHERE d.id_moxfield IN (
-            SELECT deck_id FROM deck_cards WHERE card_name = ?
-        )
-        {inv_cond_d}
-        {time_filtered_cond}
-        AND c.card_name != ?
-        GROUP BY c.card_name
-    """
-    syn_params = [card_name] + inv_params + [card_name]
-    syn_rows = c.execute(syn_query, syn_params).fetchall()
-    conn.close()
-    
+
     syn_df = []
     for r in syn_rows:
         freq = r['freq']
@@ -2187,7 +2200,7 @@ def get_card_details_cached(card_name: str, filtro_tempo: str):
         "oracles": card_info_cache.get("oracles", []),
         "total_decks_with_card": total_decks_time,
         "total_decks_global": total_decks_global,
-        "commanders": cmd_list[:15],
+        "commanders": cmd_list,
         "synergies": syn_formatted
     }
 

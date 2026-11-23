@@ -127,6 +127,63 @@ def _extract_nonland_oracle_and_flags(card_info: dict) -> Tuple[str, str, bool, 
     return type_line, oracle_clean, is_pure_land, has_land_front, is_instant_sorcery
 
 
+_RE_COUNTERSPELL_TARGET = re.compile(r"\bcounter target\b[^.]*\b(spell|activated|triggered|ability)\b")
+_RE_COUNTERSPELL_BOUNCE = re.compile(r"\breturn target spell to its owner's hand\b")
+
+_RE_DISCARD_HAND = re.compile(r"\b(target (?:player|opponent)|each opponent) (?:reveals their hand|discards?)\b")
+_RE_DISCARD_OPP = re.compile(r"\btarget opponent discards\b")
+_RE_DISCARD_CHOOSE = re.compile(r"\bchoose a [^\n.]*card from (?:it|that player's hand)\b[^\n.]*\bdiscard")
+
+_RE_WIPE_DESTROY_ALL = re.compile(
+    r"\b(?:destroy|exile) all (?:creatures|nonland permanents|artifacts|enchantments|permanents|artifacts and creatures|artifacts and enchantments)\b"
+)
+_RE_WIPE_MINUS = re.compile(r"\ball creatures get -[0-9x]+/-[0-9x]+\b")
+_RE_WIPE_DAMAGE = re.compile(r"\bdeals? (?:[0-9]+|x) damage to each (?:creature|non[a-z]+ creature)\b")
+_RE_WIPE_BOUNCE_ALL = re.compile(r"\breturn all (?:nonland permanents|creatures) [^\n.]*to their owners' hands\b")
+
+_RE_BURN_DIRECT = re.compile(
+    r"\bdeals? (?:[0-9]+|x) damage to (?:any target|target player|target opponent|each opponent|target creature or player|up to [a-z]+ targets)\b"
+)
+_RE_BURN_EQUAL = re.compile(
+    r"\bdeals? damage equal to [^\n.]* to (?:any target|target player|target opponent|each opponent)\b"
+)
+
+_RE_REMOVAL_DESTROY = re.compile(
+    r"\b(?:destroy|exile) (?:up to [a-z]+ )?target (?:creature|artifact|enchantment|planeswalker|permanent|nonland permanent|attacking|blocking|tapped)\b"
+)
+_RE_REMOVAL_DESTROY_OR = re.compile(
+    r"\b(?:destroy|exile) target [a-z, ]*(?:or )?(?:creature|artifact|enchantment|planeswalker|nonland permanent)\b"
+)
+_RE_REMOVAL_MINUS = re.compile(r"\btarget (?:creature|planeswalker) gets -[0-9x]+/-[0-9x]+\b")
+_RE_REMOVAL_SAC = re.compile(r"\btarget (?:player|opponent) sacrifices a (?:creature|nonland permanent|permanent)\b")
+_RE_REMOVAL_DAMAGE = re.compile(
+    r"\bdeals? (?:[0-9]+|x) damage (?:divided as you choose )?to (?:up to [a-z]+ )?(?:any target|target creature|target planeswalker|target creature or planeswalker)\b"
+)
+_RE_REMOVAL_BOUNCE = re.compile(
+    r"\breturn (?:up to [a-z]+ )?target [a-z, ]*(?:nonland permanent|creature|artifact|enchantment|planeswalker) [^\n.]*to its owner's hand\b"
+)
+_RE_REMOVAL_PACIFISM = re.compile(r"\benchanted creature (?:can't attack|loses all abilities)\b")
+
+_RE_DRAW_MULTI = re.compile(r"\bdraw (?:two|three|four|five|six|seven|x) cards?\b")
+_RE_DRAW_SINGLE = re.compile(r"(?<!whenever you )(?<!whenever a player )(?<!opponent )(?<!opponents )\bdraw a card\b")
+_RE_DRAW_TOP = re.compile(r"\b(?:look at the top|reveal the top) [^\n.]*put [^\n.]* into your hand\b")
+_RE_DRAW_AMONG = re.compile(r"\bput [^\n.]* from among them into your hand\b")
+
+_RE_TUTOR_NONLAND = re.compile(
+    r"\bsearch your library for (?:a|an|up to [a-z]+) (?!basic land|land card|plains|island|swamp|mountain|forest)"
+)
+_RE_TUTOR_LAND_EXCL = re.compile(
+    r"\bsearch your library for (?:a|an|up to [a-z]+) (?:basic )?(?:plains|island|swamp|mountain|forest|land)(?:,| or| card)"
+)
+
+_RE_RAMP_TAP_ADD = re.compile(r"\{t\}(?:, [^:]*)?:\s*add \{")
+_RE_RAMP_TAP_ANY = re.compile(r"\{t\}(?:, [^:]*)?:\s*add one mana\b")
+_RE_RAMP_LAND_SEARCH = re.compile(
+    r"\bsearch your library for (?:a|an|up to [a-z]+) (?:basic )?(?:plains|island|swamp|mountain|forest|land)"
+)
+_RE_RAMP_RITUAL = re.compile(r"\badd \{[wubrgc]+\}")
+
+
 def classify_card_roles(card_info: dict) -> List[str]:
     """Classifica una carta nei ruoli funzionali Centurion sulla base di oracle text e type line."""
     if not card_info:
@@ -140,65 +197,44 @@ def classify_card_roles(card_info: dict) -> List[str]:
 
     # 1. Counterspell
     if (
-        re.search(r"\bcounter target\b[^.]*\b(spell|activated|triggered|ability)\b", o)
-        or re.search(r"\breturn target spell to its owner's hand\b", o)
+        _RE_COUNTERSPELL_TARGET.search(o)
+        or _RE_COUNTERSPELL_BOUNCE.search(o)
     ):
         roles.add("counterspell")
 
     # 2. Discard / Scartini
     if (
-        re.search(r"\b(target (?:player|opponent)|each opponent) (?:reveals their hand|discards?)\b", o)
-        or re.search(r"\btarget opponent discards\b", o)
-        or re.search(r"\bchoose a [^\n.]*card from (?:it|that player's hand)\b[^\n.]*\bdiscard", o)
+        _RE_DISCARD_HAND.search(o)
+        or _RE_DISCARD_OPP.search(o)
+        or _RE_DISCARD_CHOOSE.search(o)
     ):
         roles.add("discard")
 
     # 3. Board Wipe / Sweeper
     if not is_pure_land and (
-        re.search(
-            r"\b(?:destroy|exile) all (?:creatures|nonland permanents|artifacts|enchantments|permanents|artifacts and creatures|artifacts and enchantments)\b",
-            o,
-        )
-        or re.search(r"\ball creatures get -[0-9x]+/-[0-9x]+\b", o)
-        or re.search(r"\bdeals? (?:[0-9]+|x) damage to each (?:creature|non[a-z]+ creature)\b", o)
-        or re.search(r"\breturn all (?:nonland permanents|creatures) [^\n.]*to their owners' hands\b", o)
+        _RE_WIPE_DESTROY_ALL.search(o)
+        or _RE_WIPE_MINUS.search(o)
+        or _RE_WIPE_DAMAGE.search(o)
+        or _RE_WIPE_BOUNCE_ALL.search(o)
     ):
         roles.add("board_wipe")
 
     # 4. Burn / Botti (danni diretti a giocatore / avversario / qualsiasi bersaglio)
     if not is_pure_land and (
-        re.search(
-            r"\bdeals? (?:[0-9]+|x) damage to (?:any target|target player|target opponent|each opponent|target creature or player|up to [a-z]+ targets)\b",
-            o,
-        )
-        or re.search(
-            r"\bdeals? damage equal to [^\n.]* to (?:any target|target player|target opponent|each opponent)\b",
-            o,
-        )
+        _RE_BURN_DIRECT.search(o)
+        or _RE_BURN_EQUAL.search(o)
     ):
         roles.add("burn")
 
     # 5. Removal (consente utility channel land come Boseiju/Otawara/Eiganjo, esclude LD puro come Wasteland)
     has_targeted_removal = bool(
-        re.search(
-            r"\b(?:destroy|exile) (?:up to [a-z]+ )?target (?:creature|artifact|enchantment|planeswalker|permanent|nonland permanent|attacking|blocking|tapped)\b",
-            o,
-        )
-        or re.search(
-            r"\b(?:destroy|exile) target [a-z, ]*(?:or )?(?:creature|artifact|enchantment|planeswalker|nonland permanent)\b",
-            o,
-        )
-        or re.search(r"\btarget (?:creature|planeswalker) gets -[0-9x]+/-[0-9x]+\b", o)
-        or re.search(r"\btarget (?:player|opponent) sacrifices a (?:creature|nonland permanent|permanent)\b", o)
-        or re.search(
-            r"\bdeals? (?:[0-9]+|x) damage (?:divided as you choose )?to (?:up to [a-z]+ )?(?:any target|target creature|target planeswalker|target creature or planeswalker)\b",
-            o,
-        )
-        or re.search(
-            r"\breturn (?:up to [a-z]+ )?target [a-z, ]*(?:nonland permanent|creature|artifact|enchantment|planeswalker) [^\n.]*to its owner's hand\b",
-            o,
-        )
-        or ("aura" in type_line and re.search(r"\benchanted creature (?:can't attack|loses all abilities)\b", o))
+        _RE_REMOVAL_DESTROY.search(o)
+        or _RE_REMOVAL_DESTROY_OR.search(o)
+        or _RE_REMOVAL_MINUS.search(o)
+        or _RE_REMOVAL_SAC.search(o)
+        or _RE_REMOVAL_DAMAGE.search(o)
+        or _RE_REMOVAL_BOUNCE.search(o)
+        or ("aura" in type_line and _RE_REMOVAL_PACIFISM.search(o))
     )
     if has_targeted_removal and not (
         "target nonbasic land" in o and "creature" not in o and "nonland" not in o and "artifact" not in o
@@ -206,11 +242,11 @@ def classify_card_roles(card_info: dict) -> List[str]:
         roles.add("removal")
 
     # 6. Card Draw (esclude trigger punitivi "draws a card" / "whenever you draw a card" e cantrip su removal/counter)
-    has_multi_draw = bool(re.search(r"\bdraw (?:two|three|four|five|six|seven|x) cards?\b", o))
-    has_single_draw = bool(re.search(r"(?<!whenever you )(?<!whenever a player )(?<!opponent )(?<!opponents )\bdraw a card\b", o))
+    has_multi_draw = bool(_RE_DRAW_MULTI.search(o))
+    has_single_draw = bool(_RE_DRAW_SINGLE.search(o))
     has_card_selection_hand = bool(
-        re.search(r"\b(?:look at the top|reveal the top) [^\n.]*put [^\n.]* into your hand\b", o)
-        or re.search(r"\bput [^\n.]* from among them into your hand\b", o)
+        _RE_DRAW_TOP.search(o)
+        or _RE_DRAW_AMONG.search(o)
     )
     if not is_pure_land and (has_multi_draw or has_single_draw or has_card_selection_hand):
         is_cantrip_rider = (has_single_draw and not has_multi_draw) and bool(
@@ -220,26 +256,20 @@ def classify_card_roles(card_info: dict) -> List[str]:
             roles.add("card_draw")
 
     # 7. Tutor (esclude terre come Urza's Saga e ricerche di sole terre)
-    if not has_land_front and re.search(
-        r"\bsearch your library for (?:a|an|up to [a-z]+) (?!basic land|land card|plains|island|swamp|mountain|forest)",
-        o,
-    ):
-        if not re.search(
-            r"\bsearch your library for (?:a|an|up to [a-z]+) (?:basic )?(?:plains|island|swamp|mountain|forest|land)(?:,| or| card)",
-            o,
-        ):
+    if not has_land_front and _RE_TUTOR_NONLAND.search(o):
+        if not _RE_TUTOR_LAND_EXCL.search(o):
             roles.add("tutor")
 
     # 8. Ramp (dork, mana rock, rituali, ramp di terre sul campo)
     if not has_land_front and (
-        re.search(r"\{t\}(?:, [^:]*)?:\s*add \{", o)
-        or re.search(r"\{t\}(?:, [^:]*)?:\s*add one mana\b", o)
+        _RE_RAMP_TAP_ADD.search(o)
+        or _RE_RAMP_TAP_ANY.search(o)
         or (
-            re.search(r"\bsearch your library for (?:a|an|up to [a-z]+) (?:basic )?(?:plains|island|swamp|mountain|forest|land)", o)
+            _RE_RAMP_LAND_SEARCH.search(o)
             and "onto the battlefield" in o
             and "sacrifice a land" not in o
         )
-        or (is_instant_sorcery and re.search(r"\badd \{[wubrgc]+\}", o))
+        or (is_instant_sorcery and _RE_RAMP_RITUAL.search(o))
         or ("land" in o and "additional land" in o)
     ):
         roles.add("ramp")

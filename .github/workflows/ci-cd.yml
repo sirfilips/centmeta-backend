@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main, dev ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, dev ]
 
 permissions:
   contents: read
@@ -17,6 +17,7 @@ jobs:
   ci:
     name: Lint & Validation (Cloud)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,14 +32,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff
+          pip install "ruff>=0.8.0,<1.0.0"
 
-      - name: Lint for syntax and critical errors
-        run: ruff check --select E9,F63,F7,F82 .
+      - name: Lint for syntax and logic errors
+        run: ruff check --select E9,F .
+
+      - name: Validate start.sh
+        run: |
+          bash -n start.sh
+          shellcheck --severity=warning start.sh
 
       - name: Compile and smoke test
         run: |
-          python -m py_compile main.py master_scraper.py
+          python -m py_compile main.py master_scraper.py scryfall_search.py tests/test_core.py
           python -c "import main; print('FastAPI main module verified successfully')"
 
       - name: Run unit tests
@@ -49,35 +55,73 @@ jobs:
     needs: ci
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: self-hosted
+    timeout-minutes: 15
+    environment: production
     steps:
       - name: Pull changes and reload service
         run: |
           set -euo pipefail
-          echo "[Deploy] Acquisizione lock esclusivo per prevenire deploy concorrenti..."
+          echo "[Deploy] Acquisizione lock esclusivo (timeout 300s)..."
           exec 200>/tmp/centmeta_deploy.lock
-          flock 200
+          flock -w 300 200
 
           echo "[Deploy] Navigazione nella directory di produzione..."
           cd /home/CenturionREC
-          
-          echo "[Deploy] Reset modifiche locali ai file tracciati (es. package-lock.json)..."
+
+          SUDO=""
+          if command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          fi
+
+          restart_and_verify() {
+            $SUDO systemctl restart centurionrec.service
+            $SUDO systemctl is-active --quiet centurionrec.service || return 1
+            local i
+            for i in $(seq 1 15); do
+              if curl -fsS --max-time 2 http://127.0.0.1:8000/api/health >/dev/null 2>&1 && \
+                 curl -fsS --max-time 2 http://127.0.0.1:3000/ >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 3
+            done
+            return 1
+          }
+
+          echo "[Deploy] Ripristino eventuali modifiche ai file tracciati (preservando .env, DB e cache)..."
           git checkout -- .
-          
+
+          PREV_SHA=$(git rev-parse HEAD)
           echo "[Deploy] Git pull da main..."
           git pull --ff-only origin main
-          
-          echo "[Deploy] Aggiornamento dipendenze nel venv..."
-          source venv/bin/activate
-          pip install -r requirements.txt
-          
-          echo "[Deploy] Riavvio servizio CentMeta (centurionrec)..."
-          if command -v sudo >/dev/null 2>&1; then
-            sudo systemctl restart centurionrec.service
-            sudo systemctl is-active --quiet centurionrec.service
-          else
-            systemctl restart centurionrec.service
-            systemctl is-active --quiet centurionrec.service
-          fi
-          
-          echo "[Deploy] Deploy completato con successo!"
+          NEW_SHA=$(git rev-parse HEAD)
 
+          echo "[Deploy] Attivazione virtualenv..."
+          set +u
+          source venv/bin/activate
+          set -u
+
+          REQUIREMENTS_CHANGED=0
+          if [[ "$PREV_SHA" == "$NEW_SHA" ]] || ! git diff --quiet "$PREV_SHA" "$NEW_SHA" -- requirements.txt; then
+            REQUIREMENTS_CHANGED=1
+            echo "[Deploy] Aggiornamento dipendenze nel venv..."
+            pip install --disable-pip-version-check -r requirements.txt
+          else
+            echo "[Deploy] requirements.txt invariato, skip pip install."
+          fi
+
+          echo "[Deploy] Riavvio servizio CentMeta e verifica HTTP..."
+          if ! restart_and_verify; then
+            echo "[Deploy] ERRORE: healthcheck post-riavvio fallito! Log recenti:" >&2
+            $SUDO journalctl -u centurionrec.service -n 40 --no-pager || true
+            if [[ "$PREV_SHA" != "$NEW_SHA" ]]; then
+              echo "[Deploy] Rollback automatico a $PREV_SHA..." >&2
+              git reset --hard "$PREV_SHA"
+              if [[ "$REQUIREMENTS_CHANGED" -eq 1 ]]; then
+                pip install --disable-pip-version-check -r requirements.txt || true
+              fi
+            fi
+            $SUDO systemctl restart centurionrec.service || true
+            exit 1
+          fi
+
+          echo "[Deploy] Deploy completato con successo!"

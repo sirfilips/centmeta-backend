@@ -3,7 +3,6 @@ import os
 import sqlite3
 import sys
 import tempfile
-import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch

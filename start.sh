@@ -48,21 +48,24 @@ stop_all() {
   if [[ -f "$BASE_DIR/scraper.lock" ]] && command -v flock >/dev/null 2>&1 && ! flock -n "$BASE_DIR/scraper.lock" true 2>/dev/null; then
     log "ATTENZIONE: Scraper attivo rilevato: attesa fino a ${STOP_TIMEOUT}s per chiusura transazione pulita."
   fi
-  for pid in $PID_BACKEND $PID_FRONTEND; do
+  for pid in "$PID_BACKEND" "$PID_FRONTEND"; do
+    [[ -n "$pid" ]] || continue
     kill -TERM "$pid" 2>/dev/null || true
   done
   # Attende la chiusura spontanea, poi forza
   local waited=0
   while (( waited < STOP_TIMEOUT )); do
     local alive=0
-    for pid in $PID_BACKEND $PID_FRONTEND; do
+    for pid in "$PID_BACKEND" "$PID_FRONTEND"; do
+      [[ -n "$pid" ]] || continue
       kill -0 "$pid" 2>/dev/null && alive=1
     done
     (( alive == 0 )) && break
     sleep 1
     waited=$((waited + 1))
   done
-  for pid in $PID_BACKEND $PID_FRONTEND; do
+  for pid in "$PID_BACKEND" "$PID_FRONTEND"; do
+    [[ -n "$pid" ]] || continue
     if kill -0 "$pid" 2>/dev/null; then
       log "Processo $pid non terminato entro ${STOP_TIMEOUT}s, invio SIGKILL."
       kill -KILL "$pid" 2>/dev/null || true

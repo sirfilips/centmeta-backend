@@ -282,18 +282,24 @@ def _perform_health_pings():
         conn.close()
     print(f"[HEALTH] Controllo stato completato alle {now}")
 
-async def background_health_pinger():
+async def background_health_pinger(stop_event: Optional[threading.Event] = None):
     while True:
+        if stop_event is not None and stop_event.is_set():
+            break
         try:
             await run_in_threadpool(_perform_health_pings)
         except asyncio.CancelledError:
             break
         except Exception as e:
             logging.error(f"[HEALTH ERROR] Errore critico nel loop di ping: {e}")
+        if stop_event is not None and stop_event.is_set():
+            break
         await asyncio.sleep(3600)
 
-async def warmup_caches(periodi: Optional[List[str]] = None):
+async def warmup_caches(periodi: Optional[List[str]] = None, stop_event: Optional[threading.Event] = None):
     """Esegue il pre-warming della cache. Se non specificato, scalda tutti i periodi."""
+    if stop_event is not None and stop_event.is_set():
+        return
     if periodi is None:
         periodi = [
             "Ultimi 7 giorni",
@@ -305,15 +311,23 @@ async def warmup_caches(periodi: Optional[List[str]] = None):
         ]
     print(f"[WARMUP] Avvio pre-warming per {len(periodi)} periodo/i: {', '.join(periodi)}...")
     await run_in_threadpool(get_global_commanders_validity)
+    if stop_event is not None and stop_event.is_set():
+        return
     await run_in_threadpool(get_global_cards_stats)
     for periodo in periodi:
+        if stop_event is not None and stop_event.is_set():
+            return
         print(f"[WARMUP] Costruzione cache per: {periodo}...")
         await run_in_threadpool(get_decks_stats_cached, periodo, None)
+        if stop_event is not None and stop_event.is_set():
+            return
         await run_in_threadpool(get_dashboard_data_cached, periodo)
     print("[WARMUP] Pre-warming completato. Sistema pronto.")
 
-async def background_db_updater():
+async def background_db_updater(stop_event: Optional[threading.Event] = None):
     while True:
+        if stop_event is not None and stop_event.is_set():
+            break
         try:
             now = datetime.now()
             target = datetime.combine(now.date(), time(23, 0))
@@ -324,13 +338,18 @@ async def background_db_updater():
             print(f"[CRON] Prossimo aggiornamento alle 23:00 (tra {int(seconds_to_wait / 3600)} ore).")
             
             await asyncio.sleep(seconds_to_wait)
+            if stop_event is not None and stop_event.is_set():
+                break
             print("[CRON] Avvio aggiornamento giornaliero del database...")
 
-            scraped = await run_in_threadpool(master_scraper.run_scraper)
+            scraped = await run_in_threadpool(master_scraper.run_scraper, stop_event)
+            if stop_event is not None and stop_event.is_set():
+                print("[CRON] Arresto richiesto: interruzione pulita post-scraper.")
+                break
             if scraped:
-                clear_all_caches()
+                await run_in_threadpool(clear_all_caches)
                 # Alle 23:00 scalda tutti i periodi
-                await warmup_caches()
+                await warmup_caches(stop_event=stop_event)
             else:
                 print("[CRON] Scraper saltato o già in corso su un altro processo: cache conservate.")
             
@@ -338,6 +357,8 @@ async def background_db_updater():
             break
         except Exception as e:
             print(f"[CRON ERROR] Errore aggiornamento: {e}")
+            if stop_event is not None and stop_event.is_set():
+                break
             await asyncio.sleep(3600)
 
 CARTELLA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
@@ -364,14 +385,9 @@ def get_db_mtime():
 async def lifespan(app: FastAPI):
     orig_mtime = get_db_mtime()
 
-    # Abilita il WAL mode prima di qualsiasi altra operazione
-    conn = get_db()
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-    finally:
-        conn.close()
-
-    setup_health_db(init_main_blacklist=True)
+    # Inizializza sempre lo schema base del DB principale (idempotente su DB esistente, sicuro su DB vuoto)
+    master_scraper.init_db(DB_PATH)
+    setup_health_db(init_main_blacklist=False)
     sanitize_commanders_in_db()
     setup_database_indices()
 
@@ -385,25 +401,38 @@ async def lifespan(app: FastAPI):
             os.utime(DB_PATH, (orig_mtime, orig_mtime))
         except Exception:
             pass
-    
-    updater_task = asyncio.create_task(background_db_updater())
-    health_task = asyncio.create_task(background_health_pinger())
+
+    shutdown_event = threading.Event()
+    updater_task = asyncio.create_task(background_db_updater(shutdown_event))
+    health_task = asyncio.create_task(background_health_pinger(shutdown_event))
     
     # Pre-caching in background all'avvio solo per il periodo di default (30 giorni)
     async def deferred_warmup():
-        await asyncio.sleep(2)  # Permette a Uvicorn di aprire la porta e accettare connessioni subito
-        await warmup_caches(["Ultimi 30 giorni"])
+        try:
+            await asyncio.sleep(2)  # Permette a Uvicorn di aprire la porta e accettare connessioni subito
+            if not shutdown_event.is_set():
+                await warmup_caches(["Ultimi 30 giorni"], stop_event=shutdown_event)
+        except asyncio.CancelledError:
+            pass
 
     warmup_task = asyncio.create_task(deferred_warmup())
-    artist_backfill_task = asyncio.create_task(background_scryfall_artist_backfill())
+    artist_backfill_task = asyncio.create_task(background_scryfall_artist_backfill(shutdown_event))
 
-    yield  # <-- Il server apre la porta ORA ed è subito accessibile
-
-    if warmup_task:
-        warmup_task.cancel()
-    artist_backfill_task.cancel()
-    updater_task.cancel()
-    health_task.cancel()
+    try:
+        yield  # <-- Il server apre la porta ORA ed è subito accessibile
+    finally:
+        shutdown_event.set()
+        bg_tasks = [t for t in (warmup_task, artist_backfill_task, updater_task, health_task) if t is not None]
+        for task in bg_tasks:
+            task.cancel()
+        if bg_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*bg_tasks, return_exceptions=True),
+                    timeout=270.0,
+                )
+            except asyncio.TimeoutError:
+                logging.warning("[SHUTDOWN] Timeout attesa chiusura background task (270s).")
 
 app = FastAPI(title="CentMeta API", version="4.0.0", lifespan=lifespan)
 
@@ -869,16 +898,20 @@ def backfill_scryfall_artists() -> int:
         clear_all_caches()
     return total_updated
 
-async def background_scryfall_artist_backfill():
+async def background_scryfall_artist_backfill(stop_event: Optional[threading.Event] = None):
     try:
         await asyncio.sleep(15)
+        if stop_event is not None and stop_event.is_set():
+            return
         targets = await run_in_threadpool(collect_missing_artist_targets)
-        if not targets:
+        if not targets or (stop_event is not None and stop_event.is_set()):
             return
         print(f"[SCRYFALL BACKFILL] Avvio recupero artisti in background per {len(targets)} carte in cache...")
         total_updated = 0
         if len(targets) > SCRYFALL_BULK_BACKFILL_THRESHOLD:
             bulk_updates = await run_in_threadpool(backfill_scryfall_artists_from_bulk, targets)
+            if stop_event is not None and stop_event.is_set():
+                return
             if bulk_updates:
                 await run_in_threadpool(_commit_scryfall_cache_updates, bulk_updates)
                 total_updated += len(bulk_updates)
@@ -886,13 +919,13 @@ async def background_scryfall_artist_backfill():
             else:
                 targets = []
 
-        if targets and len(targets) <= SCRYFALL_BULK_BACKFILL_THRESHOLD:
+        if targets and len(targets) <= SCRYFALL_BULK_BACKFILL_THRESHOLD and not (stop_event is not None and stop_event.is_set()):
             updates, _ = await run_in_threadpool(backfill_scryfall_artists_batch, targets)
-            if updates:
+            if updates and not (stop_event is not None and stop_event.is_set()):
                 await run_in_threadpool(_commit_scryfall_cache_updates, updates)
                 total_updated += len(updates)
 
-        if total_updated > 0:
+        if total_updated > 0 and not (stop_event is not None and stop_event.is_set()):
             await run_in_threadpool(clear_all_caches)
         print(f"[SCRYFALL BACKFILL] Completato: aggiornati {total_updated} record nella cache.")
     except asyncio.CancelledError:
@@ -2574,6 +2607,20 @@ async def get_metagame_history(granularity: str = "month", months: int = 12, top
     return await run_in_threadpool(get_metagame_history_cached, granularity, months, top_n)
 
 def _get_health_status_sync():
+    main_conn = None
+    try:
+        main_conn = get_db()
+        main_conn.execute("SELECT 1 FROM decks LIMIT 1").fetchone()
+    except Exception as e:
+        logging.error(f"[HEALTH ERROR] Database principale non disponibile: {e}")
+        raise HTTPException(status_code=503, detail="Database principale non disponibile")
+    finally:
+        if main_conn is not None:
+            try:
+                main_conn.close()
+            except Exception:
+                pass
+
     try:
         mtime = get_db_mtime()
         db_last_updated = datetime.fromtimestamp(mtime).isoformat() if mtime else None
@@ -2581,6 +2628,7 @@ def _get_health_status_sync():
         db_last_updated = None
 
     history = {"moxfield": [], "scryfall": []}
+    health_db_ok = True
     
     h_conn = get_health_db()
     h_c = h_conn.cursor()
@@ -2594,12 +2642,15 @@ def _get_health_status_sync():
                     "status": row['status'],
                     "timestamp": row['timestamp']
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        health_db_ok = False
+        logging.warning(f"[HEALTH ERROR] Impossibile leggere health_logs: {e}")
     finally:
         h_conn.close()
         
     return {
+        "status": "ok",
+        "health_db_ok": health_db_ok,
         "db_last_updated": db_last_updated,
         "history": history
     }

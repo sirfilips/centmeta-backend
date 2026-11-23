@@ -8,6 +8,7 @@ from logging.handlers import RotatingFileHandler
 import threading
 import requests
 from datetime import datetime
+from typing import Optional
 
 try:
     from dotenv import load_dotenv
@@ -173,40 +174,51 @@ def ensure_covering_indices(cursor):
 
 def init_db(db_path):
     conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout = 30000;")
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS decks (
-            id_moxfield TEXT PRIMARY KEY,
-            comandante TEXT,
-            data_aggiornamento TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS deck_cards (
-            deck_id TEXT,
-            card_name TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS blacklist (
-            id_moxfield TEXT PRIMARY KEY,
-            data_rimozione TEXT
-        )
-    ''')
-    # Creazione degli indici covering ottimizzati (condivisi con main.py)
-    ensure_covering_indices(cursor)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout = 30000;")
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS decks (
+                id_moxfield TEXT PRIMARY KEY,
+                comandante TEXT,
+                data_aggiornamento TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS deck_cards (
+                deck_id TEXT,
+                card_name TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS blacklist (
+                id_moxfield TEXT PRIMARY KEY,
+                data_rimozione TEXT
+            )
+        ''')
+        # Creazione degli indici covering ottimizzati (condivisi con main.py)
+        ensure_covering_indices(cursor)
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
-def scarica_singolo_mazzo(deck_base):
+def _interruptible_sleep(seconds: float, stop_event: Optional[threading.Event]) -> bool:
+    """Attende `seconds` secondi; restituisce True se interrotto da stop_event."""
+    if stop_event is None:
+        time.sleep(seconds)
+        return False
+    return stop_event.wait(seconds)
+
+def scarica_singolo_mazzo(deck_base, stop_event: Optional[threading.Event] = None):
     deck_id = deck_base.get("publicId")
     detail_url = f"https://api.moxfield.com/v2/decks/all/{deck_id}"
 
     # Massimo 1 tentativo iniziale + 3 retry
     for attempt in range(4):
+        if stop_event is not None and stop_event.is_set():
+            return None
         try:
             response = rate_limited_get(detail_url, timeout=15)
             
@@ -259,18 +271,21 @@ def scarica_singolo_mazzo(deck_base):
                     logging.error(f"Mazzo {deck_id} saltato: esauriti i tentativi per 429.")
                     break
                 logging.warning(f"Rilevato 429 per mazzo {deck_id}. Attesa di {wait_time}s")
-                time.sleep(wait_time)
+                if _interruptible_sleep(wait_time, stop_event):
+                    return None
             else:
                 logging.warning(f"Errore {response.status_code} per mazzo {deck_id}")
                 if attempt < 3:
-                    time.sleep(5)
+                    if _interruptible_sleep(5, stop_event):
+                        return None
                 else:
                     logging.error(f"Mazzo {deck_id} saltato: esauriti i tentativi per errore di stato.")
                     break
         except Exception as e:
             logging.warning(f"Eccezione {type(e).__name__} per mazzo {deck_id}")
             if attempt < 3:
-                time.sleep(5)
+                if _interruptible_sleep(5, stop_event):
+                    return None
             else:
                 logging.error(f"Mazzo {deck_id} saltato: esauriti i tentativi per eccezione di rete.")
                 break
@@ -282,15 +297,15 @@ def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-def run_scraper() -> bool:
+def run_scraper(stop_event: Optional[threading.Event] = None) -> bool:
     configure_scraper_logging()
     with ScraperProcessLock(lock_path) as acquired:
         if not acquired:
             logging.warning("[LOCK] Un'altra istanza dello scraper è già in esecuzione. Operazione ignorata.")
             return False
-        return _run_scraper_locked()
+        return _run_scraper_locked(stop_event=stop_event)
 
-def _run_scraper_locked() -> bool:
+def _run_scraper_locked(stop_event: Optional[threading.Event] = None) -> bool:
     global _default_user_agent
     # Verifica e impostazione dello User-Agent obbligatorio
     ua = os.environ.get("MOXFIELD_UA")
@@ -303,7 +318,11 @@ def _run_scraper_locked() -> bool:
     _get_http_session().headers.update({"User-Agent": ua})
     
     is_dry_run = os.environ.get("SCRAPER_DRY_RUN") == "1"
-    
+
+    if stop_event is not None and stop_event.is_set():
+        logging.info("[SHUTDOWN] Scraper interrotto in modo pulito prima dell'avvio.")
+        return False
+
     init_db(db_path)
 
     # 1. IMPORTAZIONE JSON STORICO (abilitata solo se esplicitamente autorizzata con ALLOW_JSON_IMPORT=1)
@@ -408,11 +427,18 @@ def _run_scraper_locked() -> bool:
     search_failed = False
 
     while page <= MAX_PAGINE_RICERCA:
+        if stop_event is not None and stop_event.is_set():
+            logging.info("[SHUTDOWN] Scraper interrotto in modo pulito durante la ricerca pagine (nessuna modifica al DB).")
+            return False
+
         params = {"pageNumber": page, "pageSize": page_size, "fmt": "centurion"}
         success = False
         
         data = []
         for attempt in range(4):
+            if stop_event is not None and stop_event.is_set():
+                logging.info("[SHUTDOWN] Scraper interrotto in modo pulito durante il retry di ricerca.")
+                return False
             try:
                 response = rate_limited_get(search_url, params=params, timeout=10)
                 if response.status_code == 200:
@@ -428,15 +454,21 @@ def _run_scraper_locked() -> bool:
                     elif attempt == 2: wait_time = 60
                     else: break
                     logging.warning(f"Rilevato 429 durante la ricerca alla pagina {page}. Attesa di {wait_time}s")
-                    time.sleep(wait_time)
+                    if _interruptible_sleep(wait_time, stop_event):
+                        logging.info("[SHUTDOWN] Scraper interrotto in modo pulito durante attesa 429.")
+                        return False
                 else:
                     logging.warning(f"Errore {response.status_code} alla pagina {page}")
                     if attempt < 3:
-                        time.sleep(5)
+                        if _interruptible_sleep(5, stop_event):
+                            logging.info("[SHUTDOWN] Scraper interrotto in modo pulito durante retry pagina.")
+                            return False
             except Exception as e:
                 logging.warning(f"Eccezione {type(e).__name__} alla pagina {page}")
                 if attempt < 3:
-                    time.sleep(5)
+                    if _interruptible_sleep(5, stop_event):
+                        logging.info("[SHUTDOWN] Scraper interrotto in modo pulito durante attesa errore pagina.")
+                        return False
                     
         if not success:
             logging.error(f"Ricerca fallita definitivamente alla pagina {page}.")
@@ -460,7 +492,9 @@ def _run_scraper_locked() -> bool:
             
         logging.info(f"Raccolti link pagina {page} (Totale mazzi in coda: {len(search_decks)})...")
         page += 1
-        time.sleep(3.0)
+        if _interruptible_sleep(3.0, stop_event):
+            logging.info("[SHUTDOWN] Scraper interrotto in modo pulito tra le pagine di ricerca.")
+            return False
 
     if page > MAX_PAGINE_RICERCA:
         logging.warning(f"Raggiunto limite massimo pagine ({MAX_PAGINE_RICERCA}). Procedo con i mazzi raccolti.")
@@ -538,8 +572,14 @@ def _run_scraper_locked() -> bool:
         logging.info(f"Avvio download dettagli per {len(to_download)} mazzi nuovi o aggiornati...")
     
     for i, deck in enumerate(to_download):
+        if stop_event is not None and stop_event.is_set():
+            logging.info("[SHUTDOWN] Scraper interrotto in modo pulito durante il download mazzi (nessuna modifica al DB).")
+            return False
         deck_id = deck.get("publicId")
-        mazzo = scarica_singolo_mazzo(deck)
+        mazzo = scarica_singolo_mazzo(deck, stop_event=stop_event)
+        if stop_event is not None and stop_event.is_set() and mazzo is None:
+            logging.info("[SHUTDOWN] Scraper interrotto in modo pulito durante il download del mazzo (nessuna modifica al DB).")
+            return False
         
         if mazzo:
             downloaded_data[deck_id] = mazzo
@@ -557,6 +597,10 @@ def _run_scraper_locked() -> bool:
                 
         if (i + 1) % 100 == 0:
             logging.info(f"Progresso download: {i + 1}/{len(to_download)}...")
+
+    if stop_event is not None and stop_event.is_set():
+        logging.info("[SHUTDOWN] Scraper interrotto in modo pulito prima della scrittura DB.")
+        return False
 
     # 8. BACKUP PREVENTIVO E SCRITTURA NEL DB (Singola Transazione con Riconciliazione)
     if os.path.exists(db_path):

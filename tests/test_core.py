@@ -887,10 +887,36 @@ class TestEndpointBehaviorAndCardDetails(unittest.TestCase):
         }
         return Request(scope)
 
+    def test_run_scraper_respects_stop_event(self):
+        import threading
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_file = os.path.join(tmpdir, "test_centurion.db")
+            stop_ev = threading.Event()
+            stop_ev.set()
+
+            with (
+                patch.object(master_scraper, "db_path", db_file),
+                patch.object(master_scraper, "json_path", os.path.join(tmpdir, "missing.json")),
+                patch.object(master_scraper, "rate_limited_get") as mock_get,
+                patch.dict(os.environ, {"MOXFIELD_UA": "CentMetaTest/1.0"}, clear=False),
+            ):
+                ok = master_scraper._run_scraper_locked(stop_event=stop_ev)
+
+            self.assertFalse(ok)
+            mock_get.assert_not_called()
+            self.assertFalse(os.path.exists(db_file))
+
     def test_health_endpoint_returns_history(self):
         import asyncio
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            main_db = os.path.join(tmpdir, "centurion.db")
+            m_conn = sqlite3.connect(main_db)
+            m_conn.execute("CREATE TABLE decks (id_moxfield TEXT PRIMARY KEY, comandante TEXT, data_aggiornamento TEXT)")
+            m_conn.commit()
+            m_conn.close()
+
             health_db = os.path.join(tmpdir, "health.db")
             conn = sqlite3.connect(health_db)
             conn.execute("CREATE TABLE health_logs (service TEXT, status TEXT, timestamp TEXT)")
@@ -904,21 +930,81 @@ class TestEndpointBehaviorAndCardDetails(unittest.TestCase):
             conn.commit()
             conn.close()
 
+            def _get_test_db():
+                c = sqlite3.connect(main_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
             def _get_test_health_db():
                 c = sqlite3.connect(health_db, timeout=30)
                 c.row_factory = sqlite3.Row
                 return c
 
             with (
+                patch.object(main, "get_db", side_effect=_get_test_db),
                 patch.object(main, "get_health_db", side_effect=_get_test_health_db),
                 patch.object(main, "get_db_mtime", return_value=1700000000.0),
             ):
                 res = asyncio.run(main.get_health_status())
 
+            self.assertEqual(res["status"], "ok")
+            self.assertTrue(res["health_db_ok"])
             self.assertIsNotNone(res["db_last_updated"])
             self.assertEqual(len(res["history"]["moxfield"]), 1)
             self.assertEqual(res["history"]["moxfield"][0]["status"], "UP")
             self.assertEqual(res["history"]["scryfall"][0]["status"], "DOWN")
+
+    def test_health_endpoint_returns_503_when_main_db_unavailable(self):
+        import asyncio
+        from fastapi import HTTPException
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            missing_db = os.path.join(tmpdir, "empty.db")
+
+            def _get_empty_db():
+                c = sqlite3.connect(missing_db, timeout=30)
+                c.row_factory = sqlite3.Row
+                return c
+
+            with patch.object(main, "get_db", side_effect=_get_empty_db):
+                with self.assertRaises(HTTPException) as ctx:
+                    asyncio.run(main.get_health_status())
+
+            self.assertEqual(ctx.exception.status_code, 503)
+
+    def test_lifespan_initializes_fresh_db_and_shuts_down_cleanly(self):
+        import asyncio
+
+        async def _run_lifespan():
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                fresh_db = os.path.join(tmpdir, "centurion.db")
+                fresh_health = os.path.join(tmpdir, "health.db")
+
+                async def _noop_warmup(*args, **kwargs):
+                    return None
+
+                async def _noop_backfill(*args, **kwargs):
+                    return None
+
+                with (
+                    patch.object(main, "DB_PATH", fresh_db),
+                    patch.object(main, "HEALTH_DB_PATH", fresh_health),
+                    patch.object(main, "warmup_caches", side_effect=_noop_warmup),
+                    patch.object(main, "background_scryfall_artist_backfill", side_effect=_noop_backfill),
+                    patch.object(main, "_perform_health_pings", return_value=None),
+                ):
+                    async with main.lifespan(main.app):
+                        conn = sqlite3.connect(fresh_db)
+                        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                        conn.close()
+                        self.assertTrue({"decks", "deck_cards", "blacklist"}.issubset(tables))
+
+                        h_conn = sqlite3.connect(fresh_health)
+                        h_tables = {r[0] for r in h_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                        h_conn.close()
+                        self.assertIn("health_logs", h_tables)
+
+        asyncio.run(_run_lifespan())
 
     def test_card_details_slices_top_15_before_scryfall_fetch(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:

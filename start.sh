@@ -13,7 +13,8 @@ ENV_FILE="${ENV_FILE:-$BASE_DIR/.env}"              # file con MOXFIELD_UA, ADMI
 BIND_HOST="${BIND_HOST:-127.0.0.1}"                 # solo locale: il traffico esterno passa dal proxy
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
-STOP_TIMEOUT="${STOP_TIMEOUT:-300}"                 # secondi concessi per lo shutdown pulito (fino a 5 min per scraper)
+STOP_TIMEOUT="${STOP_TIMEOUT:-300}"                 # secondi concessi per lo shutdown pulito (fino a 5 min per scraper; mantenere TimeoutStopSec>=310 in systemd)
+UVICORN_GRACEFUL_TIMEOUT="${UVICORN_GRACEFUL_TIMEOUT:-30}"  # timeout graceful shutdown connessioni HTTP Uvicorn
 
 log() { echo "[start.sh] $*"; }
 die() { echo "[start.sh] ERRORE: $*" >&2; exit 1; }
@@ -82,7 +83,7 @@ trap on_signal SIGINT SIGTERM
 # --- Avvio ------------------------------------------------------------------------
 cd "$BASE_DIR"
 log "Avvio backend su $BIND_HOST:$BACKEND_PORT"
-"$VENV_DIR/bin/uvicorn" main:app --app-dir "$BASE_DIR" --host "$BIND_HOST" --port "$BACKEND_PORT" --no-access-log &
+"$VENV_DIR/bin/uvicorn" main:app --app-dir "$BASE_DIR" --host "$BIND_HOST" --port "$BACKEND_PORT" --timeout-graceful-shutdown "$UVICORN_GRACEFUL_TIMEOUT" --no-access-log &
 PID_BACKEND=$!
 
 cd "$FRONTEND_DIR"

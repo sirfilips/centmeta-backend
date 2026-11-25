@@ -1469,6 +1469,66 @@ class TestEndpointBehaviorAndCardDetails(unittest.TestCase):
             self.assertEqual(len(details["commanders"]), 2)
             self.assertEqual(details["commanders"][0]["totale_comandante"], 2 if details["commanders"][0]["comandante"] == "Kraum" else 1)
 
+    def test_compute_429_wait_seconds_respects_retry_after_and_caps(self):
+        class _Resp:
+            def __init__(self, headers=None):
+                self.headers = headers or {}
+
+        self.assertEqual(master_scraper._compute_429_wait_seconds(_Resp(), 0), 10)
+        self.assertEqual(master_scraper._compute_429_wait_seconds(_Resp(), 1), 30)
+        self.assertEqual(master_scraper._compute_429_wait_seconds(_Resp(), 2), 60)
+        self.assertIsNone(master_scraper._compute_429_wait_seconds(_Resp(), 3))
+
+        self.assertEqual(master_scraper._compute_429_wait_seconds(_Resp({"Retry-After": "45"}), 0), 45)
+        self.assertEqual(master_scraper._compute_429_wait_seconds(_Resp({"Retry-After": "5"}), 0), 10)
+        self.assertEqual(master_scraper._compute_429_wait_seconds(_Resp({"retry-after": "999"}), 0), master_scraper.RETRY_AFTER_MAX_SECONDS)
+        self.assertEqual(master_scraper._compute_429_wait_seconds(_Resp({"Retry-After": "invalid"}), 0), 10)
+
+    def test_scraper_waits_between_search_pages_only(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_file = os.path.join(tmpdir, "centurion.db")
+            master_scraper.init_db(db_file)
+
+            class _Resp:
+                def __init__(self, status_code, payload):
+                    self.status_code = status_code
+                    self._payload = payload
+                    self.headers = {}
+
+                def json(self):
+                    return self._payload
+
+            def _fake_get(url, params=None, headers=None, timeout=15):
+                if "decks/search" in url:
+                    page_num = params.get("pageNumber", 1)
+                    return _Resp(
+                        200,
+                        {
+                            "totalResults": 2,
+                            "totalPages": 2,
+                            "data": [
+                                {
+                                    "publicId": f"deck_{page_num}",
+                                    "lastUpdatedAtUtc": "2026-11-24T10:00:00Z",
+                                }
+                            ],
+                        },
+                    )
+                return _Resp(404, {})
+
+            with (
+                patch.object(master_scraper, "db_path", db_file),
+                patch.object(master_scraper, "json_path", os.path.join(tmpdir, "missing.json")),
+                patch.object(master_scraper, "rate_limited_get", side_effect=_fake_get),
+                patch.object(master_scraper, "_interruptible_sleep", return_value=False) as mock_sleep,
+                patch.dict(os.environ, {"MOXFIELD_UA": "CentMetaTest/1.0", "SCRAPER_DRY_RUN": "1"}, clear=False),
+            ):
+                ok = master_scraper._run_scraper_locked()
+
+            self.assertTrue(ok)
+            self.assertEqual(mock_sleep.call_count, 1)
+            self.assertEqual(mock_sleep.call_args[0][0], master_scraper.SEARCH_PAGE_DELAY_SECONDS)
+
 
 if __name__ == "__main__":
     unittest.main()

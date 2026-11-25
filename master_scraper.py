@@ -21,6 +21,8 @@ SOGLIA_MINIMA_RISULTATI = 0.9
 MIN_MAZZI_PER_CONTROLLO = 20
 MAX_PAGINE_RICERCA = 500
 MOXFIELD_SEARCH_CAP = 10000
+SEARCH_PAGE_DELAY_SECONDS = 3.0
+RETRY_AFTER_MAX_SECONDS = 120
 
 # Inizializza i percorsi base
 cartella_script = os.path.dirname(os.path.abspath(__file__))
@@ -136,6 +138,35 @@ def rate_limited_get(url, params=None, headers=None, timeout=15):
             time.sleep(1.2 - elapsed)
         last_request_time = time.monotonic()
     return _get_http_session().get(url, params=params, headers=headers, timeout=timeout)
+
+
+def _compute_429_wait_seconds(response, attempt: int) -> Optional[int]:
+    """Calcola i secondi di attesa su HTTP 429 combinando backoff progressivo ed eventuale Retry-After."""
+    if attempt == 0:
+        base_wait = 10
+    elif attempt == 1:
+        base_wait = 30
+    elif attempt == 2:
+        base_wait = 60
+    else:
+        return None
+
+    headers = getattr(response, "headers", None)
+    raw_retry_after = None
+    if isinstance(headers, dict) or hasattr(headers, "get"):
+        raw_retry_after = headers.get("Retry-After")
+        if raw_retry_after is None:
+            raw_retry_after = headers.get("retry-after")
+
+    if raw_retry_after is not None:
+        try:
+            parsed = int(float(str(raw_retry_after).strip()))
+            if parsed > 0:
+                return min(RETRY_AFTER_MAX_SECONDS, max(base_wait, parsed))
+        except (TypeError, ValueError):
+            pass
+
+    return base_wait
 
 def normalize_partner_commander(cmd_name):
     """Normalizza e ordina alfabeticamente i nomi dei comandanti Partner (' / ')."""
@@ -266,10 +297,8 @@ def scarica_singolo_mazzo(deck_base, stop_event: Optional[threading.Event] = Non
                 }
                 
             elif response.status_code == 429:
-                if attempt == 0: wait_time = 10
-                elif attempt == 1: wait_time = 30
-                elif attempt == 2: wait_time = 60
-                else:
+                wait_time = _compute_429_wait_seconds(response, attempt)
+                if wait_time is None:
                     logging.error(f"Mazzo {deck_id} saltato: esauriti i tentativi per 429.")
                     break
                 logging.warning(f"Rilevato 429 per mazzo {deck_id}. Attesa di {wait_time}s")
@@ -457,10 +486,9 @@ def _run_scraper_locked(stop_event: Optional[threading.Event] = None) -> bool:
                     success = True
                     break
                 elif response.status_code == 429:
-                    if attempt == 0: wait_time = 10
-                    elif attempt == 1: wait_time = 30
-                    elif attempt == 2: wait_time = 60
-                    else: break
+                    wait_time = _compute_429_wait_seconds(response, attempt)
+                    if wait_time is None:
+                        break
                     logging.warning(f"Rilevato 429 durante la ricerca alla pagina {page}. Attesa di {wait_time}s")
                     if _interruptible_sleep(wait_time, stop_event):
                         logging.info("[SHUTDOWN] Scraper interrotto in modo pulito durante attesa 429.")
@@ -502,6 +530,10 @@ def _run_scraper_locked(stop_event: Optional[threading.Event] = None) -> bool:
         if reported_total_pages is not None and page >= reported_total_pages:
             break
         page += 1
+        if page <= MAX_PAGINE_RICERCA and SEARCH_PAGE_DELAY_SECONDS > 0:
+            if _interruptible_sleep(SEARCH_PAGE_DELAY_SECONDS, stop_event):
+                logging.info("[SHUTDOWN] Scraper interrotto in modo pulito tra le pagine di ricerca.")
+                return False
 
     if search_failed:
         logging.error("Fase di ricerca fallita. Interruzione senza modificare il database.")
